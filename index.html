@@ -293,7 +293,342 @@
             </tr>
           </thead>
           <tbody id="drillTableBody"></tbody>
+        </table><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="slds-header">
+    <div class="header-container">
+      <div class="header-left">
+        <div class="sf-cloud-icon">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="header-title">Queue Inflow Analytics</h1>
+          <p class="header-subtitle">Monthly Intake & Queue Dynamics Monitoring</p>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <div class="queue-badge">
+          <span class="pulse-dot"></span>
+          <span id="queueNameBadge">Admin Queue</span>
+        </div>
+        <button class="btn btn-primary" id="refreshDataBtn">↻ Refresh</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="dashboard-wrapper">
+    <div class="toolbar-card">
+      <div class="toolbar-info">
+        <label for="timeRangeSelect" class="label-badge">Timeframe:</label>
+        <select id="timeRangeSelect" class="table-filter" style="margin: 0 10px; font-weight: 600;">
+          <optgroup label="Calendar Periods">
+            <option value="thisMonth" selected>Current Month</option>
+            <option value="lastMonth">Last Calendar Month</option>
+            <option value="bothMonths">Last & Current Months</option>
+          </optgroup>
+          <optgroup label="Rolling Periods">
+            <option value="rolling30">Rolling 30 Days</option>
+          </optgroup>
+          <optgroup label="Past 4 Weeks (Individual)">
+            <option value="pastWeek1">Past Week 1 (Days 1–7 ago)</option>
+            <option value="pastWeek2">Past Week 2 (Days 8–14 ago)</option>
+            <option value="pastWeek3">Past Week 3 (Days 15–21 ago)</option>
+            <option value="pastWeek4">Past Week 4 (Days 22–28 ago)</option>
+          </optgroup>
+          <optgroup label="Custom">
+            <option value="custom">Custom Range…</option>
+          </optgroup>
+        </select>
+
+        <!-- Custom date range (shown only when "Custom Range…" is selected) -->
+        <div id="customRangeControls" class="custom-range" hidden>
+          <input type="date" id="customStartDate" aria-label="Start date" />
+          <span>to</span>
+          <input type="date" id="customEndDate" aria-label="End date" />
+          <button id="applyCustomRangeBtn" type="button" class="btn btn-sm btn-primary">Apply</button>
+          <span id="customRangeError" class="custom-range-error" role="alert"></span>
+        </div>
+
+        <span class="window-range" id="dateRangeText">Loading timeframe...</span>
+      </div>
+      <div class="toolbar-actions">
+        <input type="file" id="csvFileInput" accept=".csv, .json" style="display: none;" />
+        <button class="btn btn-sm btn-outline" onclick="document.getElementById('csvFileInput').click()">
+          Upload Salesforce CSV/JSON
+        </button>
+        <button class="btn btn-sm btn-outline" id="exportCsvBtn">Export Active Backlog CSV</button>
+      </div>
+    </div>
+
+    <!-- Case Type Tabs -->
+    <div class="tabs-nav-container">
+      <button class="tab-nav-btn active" data-tab="ALL">
+        All Inflow <span class="tab-badge" id="badgeAll">0</span>
+      </button>
+      <button class="tab-nav-btn" data-tab="Incident">
+        Incidents <span class="tab-badge" id="badgeIncident">0</span>
+      </button>
+      <button class="tab-nav-btn" data-tab="Service Request">
+        Service Requests <span class="tab-badge" id="badgeSR">0</span>
+      </button>
+      <button class="tab-nav-btn" data-tab="Query">
+        Queries <span class="tab-badge" id="badgeQuery">0</span>
+      </button>
+      <button class="tab-nav-btn" data-tab="Feature Request">
+        Feature Requests <span class="tab-badge" id="badgeFR">0</span>
+      </button>
+      <button class="tab-nav-btn" data-tab="Other" hidden>
+        Other <span class="tab-badge" id="badgeOther">0</span>
+      </button>
+    </div>
+
+    <!-- KPIs -->
+    <section class="kpi-grid">
+      <div class="kpi-card kpi-clickable" data-kpi="total" role="button" tabindex="0" aria-label="View the cases behind Total Inflow">
+        <div class="kpi-header">
+          <span class="kpi-title">TOTAL INFLOW</span>
+          <span class="kpi-icon">📥</span>
+        </div>
+        <div class="kpi-value" id="kpiTotalInflow">0</div>
+        <div class="kpi-subtext positive" id="kpiGrowth">▲ Total Routed Intake</div>
+        <span class="kpi-hint">View cases →</span>
+      </div>
+
+      <div class="kpi-card kpi-clickable" data-kpi="weekday" role="button" tabindex="0" aria-label="View the cases behind Daily Workday Average">
+        <div class="kpi-header">
+          <span class="kpi-title">DAILY WORKDAY AVERAGE</span>
+          <span class="kpi-icon">📊</span>
+        </div>
+        <div class="kpi-value" id="kpiDailyAvg">0</div>
+        <div class="kpi-subtext" id="kpiAvgSplit">5-day work week (Sat & Sun off)</div>
+        <span class="kpi-hint">View cases →</span>
+      </div>
+
+      <div class="kpi-card kpi-clickable" data-kpi="peak" role="button" tabindex="0" aria-label="View the cases behind Peak Arrival Day">
+        <div class="kpi-header">
+          <span class="kpi-title">PEAK ARRIVAL DAY</span>
+          <span class="kpi-icon">⚡</span>
+        </div>
+        <div class="kpi-value" id="kpiPeakDay">--</div>
+        <div class="kpi-subtext warning" id="kpiPeakCount">0 tickets arriving</div>
+        <span class="kpi-hint">View cases →</span>
+      </div>
+
+      <div class="kpi-card kpi-clickable" data-kpi="aging" role="button" tabindex="0" aria-label="View the cases behind Aging Cases">
+        <div class="kpi-header">
+          <span class="kpi-title">AGING CASES (> 24H)</span>
+          <span class="kpi-icon">⚠️</span>
+        </div>
+        <div class="kpi-value" id="kpiAgingCases" style="color: #ea001e;">0</div>
+        <div class="kpi-subtext warning" id="kpiAgingSubtext">New / Assigned > 24h</div>
+        <span class="kpi-hint">View cases →</span>
+      </div>
+    </section>
+
+    <!-- Visualizations -->
+    <section class="charts-grid">
+      <div class="chart-card card-span-2">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Daily Ticket Intake Velocity</h3>
+            <p class="card-subtitle">Number of cases routed into this queue per calendar day</p>
+          </div>
+          <div class="chart-controls">
+            <label class="toggle-control">
+              <input type="checkbox" id="toggleMa" checked />
+              <span>Show 7-Day Trendline</span>
+            </label>
+          </div>
+        </div>
+        <div class="canvas-container main-canvas">
+          <canvas id="dailyInflowChart"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Case Status Breakdown</h3>
+            <p class="card-subtitle">Click a slice to filter the list below</p>
+          </div>
+        </div>
+        <div class="canvas-container">
+          <canvas id="statusChart"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Hourly Arrival Curve</h3>
+            <p class="card-subtitle">Peak queue entry hours (UTC)</p>
+          </div>
+        </div>
+        <div class="canvas-container">
+          <canvas id="hourlyChart"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-card card-span-2" id="agentWorkloadCard">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Agent Workload by Ticket Type</h3>
+            <p class="card-subtitle">Every case in the chosen timeframe, grouped by owner and ticket type</p>
+          </div>
+          <div class="chart-controls agent-timeframe">
+            <label for="agentTimeframeSelect" class="label-badge" style="margin-right: 6px;">Timeframe:</label>
+            <select id="agentTimeframeSelect" class="table-filter" style="font-weight: 600;">
+              <option value="SAME" selected>Same as dashboard</option>
+              <optgroup label="Calendar Periods">
+                <option value="thisMonth">Current Month</option>
+                <option value="lastMonth">Last Calendar Month</option>
+                <option value="bothMonths">Last &amp; Current Months</option>
+              </optgroup>
+              <optgroup label="Rolling Periods">
+                <option value="rolling30">Rolling 30 Days</option>
+              </optgroup>
+              <optgroup label="Past 4 Weeks (Individual)">
+                <option value="pastWeek1">Past Week 1 (Days 1&ndash;7 ago)</option>
+                <option value="pastWeek2">Past Week 2 (Days 8&ndash;14 ago)</option>
+                <option value="pastWeek3">Past Week 3 (Days 15&ndash;21 ago)</option>
+                <option value="pastWeek4">Past Week 4 (Days 22&ndash;28 ago)</option>
+              </optgroup>
+              <optgroup label="Custom">
+                <option value="custom">Custom Range&hellip;</option>
+              </optgroup>
+            </select>
+            <div id="agentCustomControls" class="custom-range" hidden>
+              <input type="date" id="agentCustomStartDate" aria-label="Agent table start date" />
+              <span>to</span>
+              <input type="date" id="agentCustomEndDate" aria-label="Agent table end date" />
+              <button id="applyAgentCustomBtn" type="button" class="btn btn-sm btn-primary">Apply</button>
+              <span id="agentCustomError" class="custom-range-error" role="alert"></span>
+            </div>
+          </div>
+        </div>
+        <div class="table-responsive" style="margin-top: 12px;">
+          <table class="slds-table">
+            <thead>
+              <tr>
+                <th style="width: 25%;">Queue Agent</th>
+                <th style="text-align: center;">Incident</th>
+                <th style="text-align: center;">Service Request</th>
+                <th style="text-align: center;">Query</th>
+                <th style="text-align: center;">Feature Request</th>
+                <th style="text-align: center;">Other</th>
+                <th style="text-align: center; font-weight: 700;">Total Handled</th>
+              </tr>
+            </thead>
+            <tbody id="agentWorkloadTableBody"></tbody>
+            <tfoot id="agentWorkloadTableFoot" style="font-weight: 700; background: #f8f9fa;"></tfoot>
+          </table>
+        </div>
+        <div id="agentReconcile" class="agent-reconcile"></div>
+      </div>
+    </section>
+
+    <!-- Table -->
+    <section class="table-section">
+      <div class="table-card">
+        <div class="table-toolbar">
+          <div class="table-search-group">
+            <input type="text" id="searchInput" placeholder="Search Case #, Subject, Agent..." class="table-search" />
+            
+            <!-- Status Filter Dropdown with Active (Default), View All, and Individual Statuses -->
+            <select id="statusFilter" class="table-filter" style="font-weight: 600;">
+              <option value="ACTIVE" selected>Status: Active (New / Assigned)</option>
+              <option value="ALL">Status: All (View All Cases)</option>
+            </select>
+          </div>
+
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div id="statusFilterIndicator" style="display: none; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: #0176D3; background: #eef4ff; padding: 4px 10px; border-radius: 12px;">
+              <span>Status: <strong id="activeStatusLabel">Active</strong></span>
+              <button id="clearStatusFilterBtn" style="border: none; background: none; color: #ea001e; font-size: 16px; cursor: pointer; line-height: 1;">&times;</button>
+            </div>
+            <div class="record-count" id="recordCountText">Showing 0 active cases</div>
+          </div>
+        </div>
+
+        <div class="table-responsive">
+          <table class="slds-table">
+            <thead>
+              <tr>
+                <th>Case Number</th>
+                <th>Subject</th>
+                <th>Assigned Agent</th>
+                <th>Type</th>
+                <th>Priority</th>
+                <th>Origin</th>
+                <th>Age / Routed</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="casesTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Drill-down modal: cases behind a KPI card or an agent's workload -->
+  <div class="modal-backdrop" id="drillModal" aria-hidden="true">
+    <div class="modal-window drill-window" role="dialog" aria-modal="true" aria-labelledby="drillTitle">
+      <div class="modal-header">
+        <div>
+          <h2 id="drillTitle">Cases</h2>
+          <p class="card-subtitle" id="drillSubtitle"></p>
+        </div>
+        <button type="button" class="close-btn" id="drillCloseBtn" aria-label="Close">&times;</button>
+      </div>
+
+      <div class="drill-toolbar">
+        <input type="text" id="drillSearch" class="table-search drill-search" placeholder="Search case #, subject, agent, status..." />
+        <div class="drill-chips" id="drillChips"></div>
+        <div class="drill-toolbar-right">
+          <span class="record-count" id="drillCount"></span>
+          <button type="button" class="btn btn-sm btn-outline" id="drillExportBtn">Export CSV</button>
+        </div>
+      </div>
+
+      <div class="modal-body drill-body">
+        <table class="slds-table drill-table">
+          <thead>
+            <tr>
+              <th data-sort="caseNumber" tabindex="0">Case Number</th>
+              <th data-sort="subject" tabindex="0">Subject</th>
+              <th data-sort="agent" tabindex="0">Assigned Agent</th>
+              <th data-sort="type" tabindex="0">Type</th>
+              <th data-sort="priority" tabindex="0">Priority</th>
+              <th data-sort="status" tabindex="0">Status</th>
+              <th data-sort="routedDate" tabindex="0">Routed / Age</th>
+            </tr>
+          </thead>
+          <tbody id="drillTableBody"></tbody>
         </table>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" id="drillCloseFooterBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cache-busting script tag -->
+  <script src="app.js?v=3.6"></script>
+</body>
+</html>
       </div>
 
       <div class="modal-footer">

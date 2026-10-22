@@ -8,7 +8,6 @@ const state = {
   customStart: null, // YYYY-MM-DD, used when timeRange === "custom"
   customEnd: null,   // YYYY-MM-DD, used when timeRange === "custom"
   selectedTab: "ALL",
-  selectedWeek: "CURRENT_WEEK",
   selectedStatusFilter: "ACTIVE", // Default view remains Active (New / Assigned)
   queueAgents: [],
   weeklyBifurcation: null,
@@ -18,7 +17,13 @@ const state = {
   showMovingAverage: true,
   isLiveApiConnected: false,
   loadController: null,
-  weekSyncedRange: null,
+  agentRange: "SAME", // timeframe of the agent workload table ("SAME" = follow the dashboard)
+  agentCustomStart: null,
+  agentCustomEnd: null,
+  agentCases: null, // cases for the agent table when it has its own timeframe
+  agentLoading: false,
+  agentError: "",
+  agentLoadController: null,
   instanceUrl: null, // Salesforce org URL, used to link case numbers
   kpiCases: { total: [], weekday: [], peak: [], aging: [] }, // cases behind each KPI card
   kpiMeta: {},
@@ -61,37 +66,44 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadDashboardData();
 });
 
-function updateDateRangeLabel() {
-  const labelElem = document.getElementById("dateRangeText");
-  if (!labelElem) return;
+// Human-readable description of a timeframe (used by the dashboard header and the agent table)
+function describeWindow(range, customStart, customEnd) {
   const now = new Date();
   const fmt = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 
-  if (state.timeRange === "thisMonth") {
+  if (range === "thisMonth") {
     const start = new Date(now.getFullYear(), now.getMonth(), 1);
-    labelElem.textContent = `Window: ${fmt(start)} — ${fmt(now)} (Month-to-Date)`;
-  } else if (state.timeRange === "lastMonth") {
+    return `Window: ${fmt(start)} — ${fmt(now)} (Month-to-Date)`;
+  } else if (range === "lastMonth") {
     const firstDayPrevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     const lastDayPrevMonth = new Date(now.getFullYear(), now.getMonth(), 0);
     const monthName = firstDayPrevMonth.toLocaleDateString("en-US", { month: "short" });
-    labelElem.textContent = `Window: ${monthName} 01 — ${monthName} ${lastDayPrevMonth.getDate()}, ${firstDayPrevMonth.getFullYear()}`;
-  } else if (state.timeRange === "bothMonths") {
+    return `Window: ${monthName} 01 — ${monthName} ${lastDayPrevMonth.getDate()}, ${firstDayPrevMonth.getFullYear()}`;
+  } else if (range === "bothMonths") {
     const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    labelElem.textContent = `Window: ${fmt(start)} — ${fmt(now)} (2-Month Window)`;
-  } else if (state.timeRange === "rolling30") {
+    return `Window: ${fmt(start)} — ${fmt(now)} (2-Month Window)`;
+  } else if (range === "rolling30") {
     const past30 = new Date();
     past30.setDate(now.getDate() - 30);
-    labelElem.textContent = `Window: ${fmt(past30)} — ${fmt(now)}`;
-  } else if (state.timeRange === "custom" && state.customStart && state.customEnd) {
-    labelElem.textContent = `Window: ${fmt(parseLocalDate(state.customStart))} — ${fmt(parseLocalDate(state.customEnd))} (Custom)`;
-  } else if (state.timeRange.startsWith("pastWeek")) {
-    const weekNum = parseInt(state.timeRange.replace("pastWeek", ""), 10);
+    return `Window: ${fmt(past30)} — ${fmt(now)}`;
+  } else if (range === "custom" && customStart && customEnd) {
+    return `Window: ${fmt(parseLocalDate(customStart))} — ${fmt(parseLocalDate(customEnd))} (Custom)`;
+  } else if (String(range).startsWith("pastWeek")) {
+    const weekNum = parseInt(String(range).replace("pastWeek", ""), 10);
     const endDaysAgo = (weekNum - 1) * 7;
     const startDaysAgo = weekNum * 7;
     const end = new Date(); end.setDate(now.getDate() - endDaysAgo);
     const start = new Date(); start.setDate(now.getDate() - startDaysAgo);
-    labelElem.textContent = `Window: ${fmt(start)} — ${fmt(end)} (Week ${weekNum})`;
+    return `Window: ${fmt(start)} — ${fmt(end)} (Week ${weekNum})`;
   }
+  return "";
+}
+
+function updateDateRangeLabel() {
+  const labelElem = document.getElementById("dateRangeText");
+  if (!labelElem) return;
+  const text = describeWindow(state.timeRange, state.customStart, state.customEnd);
+  if (text) labelElem.textContent = text;
 }
 
 function setLoading(isLoading) {
@@ -123,10 +135,10 @@ async function loadDashboardData() {
       state.weeklyBifurcation = data.weeklyBifurcation || null;
       state.queueAgents = Array.isArray(data.queueAgents) ? data.queueAgents : [];
       state.instanceUrl = typeof data.instanceUrl === "string" && /^https:\/\//.test(data.instanceUrl) ? data.instanceUrl : null;
-      populateWeekSelectOptions();
       mapIncomingRecords(data.records);
       populateStatusFilterOptions();
       state.isLiveApiConnected = true;
+      if (state.agentRange !== "SAME") loadAgentCases();
       return;
     }
     throw new Error("Invalid response payload structure");
@@ -178,33 +190,46 @@ function normalizeType(rawType, subject = '') {
   return rawType || 'Incident';
 }
 
-function mapIncomingRecords(raw) {
-  state.cases = raw.map((r, i) => {
-    const rawDate = r.CreatedDate || new Date().toISOString();
-    const dateObj = new Date(rawDate);
+const CORE_TYPES = ["Incident", "Service Request", "Query", "Feature Request"];
 
-    return {
-      id: r.Id || `rec-${i}`,
-      caseNumber: r.CaseNumber || `00${100000 + i}`,
-      subject: r.Subject || "(No Subject)",
-      agent: r.agent && r.agent !== "Unassigned" && r.agent !== "Admin Queue" ? r.agent : "Unassigned",
-      type: normalizeType(r.Type || r.Ticket_Type__c || r.RecordType?.Name, r.Subject),
-      priority: r.Automation_Priority__c || r.Priority || "Medium",
-      origin: r.Origin || "Portal",
-      routedDate: dateObj,
-      dateKey: dateObj.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-      weekLabel: r.weekLabel || "",
-      hourOfDay: dateObj.getHours(),
-      status: r.Status || "New"
-    };
-  });
+// Anything that is not one of the four standard types goes into "Other" (raw value is kept in rawType)
+function canonicalType(rawType, subject) {
+  const t = normalizeType(rawType, subject);
+  return CORE_TYPES.includes(t) ? t : "Other";
+}
+
+// Turns one Salesforce record into the shape the dashboard uses
+function mapRecord(r, i) {
+  const rawDate = r.CreatedDate || new Date().toISOString();
+  const dateObj = new Date(rawDate);
+  const rawTypeValue = r.Type || r.Ticket_Type__c || r.RecordType?.Name;
+
+  return {
+    id: r.Id || `rec-${i}`,
+    caseNumber: r.CaseNumber || `00${100000 + i}`,
+    subject: r.Subject || "(No Subject)",
+    agent: r.agent && r.agent !== "Unassigned" && r.agent !== "Admin Queue" ? r.agent : "Unassigned",
+    rawType: String(rawTypeValue || "").trim(),
+    type: canonicalType(rawTypeValue, r.Subject),
+    priority: r.Automation_Priority__c || r.Priority || "Medium",
+    origin: r.Origin || "Portal",
+    routedDate: dateObj,
+    dateKey: dateObj.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+    weekLabel: r.weekLabel || "",
+    hourOfDay: dateObj.getHours(),
+    status: r.Status || "New"
+  };
+}
+
+function mapIncomingRecords(raw) {
+  state.cases = raw.map(mapRecord);
 
   updateTabBadges();
   applyFilters();
 }
 
 function updateTabBadges() {
-  const counts = { ALL: state.cases.length, Incident: 0, "Service Request": 0, Query: 0, "Feature Request": 0 };
+  const counts = { ALL: state.cases.length, Incident: 0, "Service Request": 0, Query: 0, "Feature Request": 0, Other: 0 };
   state.cases.forEach((c) => {
     if (counts[c.type] !== undefined) counts[c.type]++;
   });
@@ -219,6 +244,19 @@ function updateTabBadges() {
   setBadge("badgeSR", counts["Service Request"]);
   setBadge("badgeQuery", counts.Query);
   setBadge("badgeFR", counts["Feature Request"]);
+  setBadge("badgeOther", counts.Other);
+
+  // The "Other" tab only appears when some cases don't fit the four standard types
+  const otherTab = document.querySelector('.tab-nav-btn[data-tab="Other"]');
+  if (otherTab) {
+    otherTab.hidden = counts.Other === 0;
+    if (counts.Other === 0 && state.selectedTab === "Other") {
+      state.selectedTab = "ALL";
+      document.querySelectorAll(".tab-nav-btn").forEach((b) => {
+        b.classList.toggle("active", b.getAttribute("data-tab") === "ALL");
+      });
+    }
+  }
 }
 
 // Returns the [start, end] day window (local time) covered by the selected timeframe
@@ -248,51 +286,6 @@ function getTimeWindow() {
 function parseLocalDate(iso) {
   const [y, m, d] = iso.split("-").map(Number);
   return new Date(y, m - 1, d);
-}
-
-function populateWeekSelectOptions() {
-  const select = document.getElementById("agentWeekSelect");
-  if (!select) return;
-
-  const rangeChanged = state.weekSyncedRange !== state.timeRange;
-  state.weekSyncedRange = state.timeRange;
-  const [winStart, winEnd] = getTimeWindow();
-
-  select.innerHTML = "";
-  const addOption = (parent, value, text) => {
-    const opt = document.createElement("option");
-    opt.value = value;
-    opt.textContent = text;
-    parent.appendChild(opt);
-  };
-
-  const allowed = new Set(["ALL_WEEKS"]);
-  if (state.timeRange === "thisMonth" || state.timeRange === "rolling30" || state.timeRange === "pastWeek1") {
-    addOption(select, "CURRENT_WEEK", state.timeRange === "thisMonth" ? "Current Week" : "Last 7 Days");
-    allowed.add("CURRENT_WEEK");
-  }
-  addOption(select, "ALL_WEEKS", "All Weeks (Combined)");
-
-  // Only list calendar weeks that overlap the selected timeframe
-  const weeks = ((state.weeklyBifurcation && state.weeklyBifurcation.allWeeks) || []).filter(
-    (w) => !w.startDate || (parseLocalDate(w.endDate) >= winStart && parseLocalDate(w.startDate) <= winEnd)
-  );
-  if (weeks.length) {
-    const optGroup = document.createElement("optgroup");
-    optGroup.label = "Weeks in Selected Timeframe";
-    weeks.forEach((w) => {
-      addOption(optGroup, w.label, `${w.month} - ${w.label} (${w.week})`);
-      allowed.add(w.label);
-    });
-    select.appendChild(optGroup);
-  }
-
-  // On a timeframe change, reset to the natural default; otherwise keep the user's pick if still valid
-  const preferred = rangeChanged
-    ? (state.timeRange === "thisMonth" ? "CURRENT_WEEK" : "ALL_WEEKS")
-    : state.selectedWeek;
-  select.value = allowed.has(preferred) ? preferred : "ALL_WEEKS";
-  state.selectedWeek = select.value;
 }
 
 function populateStatusFilterOptions() {
@@ -331,6 +324,7 @@ function renderDashboard() {
   renderStatusChart();
   renderHourlyCurveChart();
   renderAgentWorkloadTable();
+  renderAgentNote();
   renderTable();
 }
 
@@ -666,21 +660,39 @@ function renderHourlyCurveChart() {
   });
 }
 
-// Cases that feed the Weekly Agent Workload table (respects the Select Week dropdown)
-function getAgentScopedCases() {
-  const now = new Date();
-  return state.filteredCases.filter((c) => {
-    if (c.agent === "Unassigned") return false;
+// "Other (Problem)" for cases whose type is outside the four standard ones
+function typeLabel(c) {
+  return c.type === "Other" && c.rawType ? `Other (${c.rawType})` : c.type;
+}
 
-    if (state.selectedWeek === "CURRENT_WEEK") {
-      const diffDays = (now - c.routedDate) / (1000 * 60 * 60 * 24);
-      return diffDays <= 7;
-    } else if (state.selectedWeek === "ALL_WEEKS") {
-      return true;
-    } else {
-      return c.weekLabel === state.selectedWeek;
-    }
-  });
+/* =========================================================================
+ * Agent workload table
+ * Has its own timeframe. "Same as dashboard" (default) uses exactly the cases
+ * behind the KPI cards, so the totals are identical by construction.
+ * Every case lands in exactly one row: a queue agent, Unassigned, or Others.
+ * ========================================================================= */
+
+const UNASSIGNED_KEY = "__UNASSIGNED__";
+const OTHERS_KEY = "__OTHERS__";
+const AGENT_TYPES = ["Incident", "Service Request", "Query", "Feature Request", "Other"];
+
+function caseGroupKey(c, members) {
+  if (c.agent === "Unassigned") return UNASSIGNED_KEY;
+  return members.has(c.agent) ? c.agent : OTHERS_KEY;
+}
+
+function getAgentBaseCases() {
+  if (state.agentRange === "SAME") return state.filteredCases;
+  const f = getFilterCriteria();
+  return (state.agentCases || []).filter((c) => caseMatchesFilters(c, f));
+}
+
+function getAgentWindowText() {
+  const text =
+    state.agentRange === "SAME"
+      ? describeWindow(state.timeRange, state.customStart, state.customEnd)
+      : describeWindow(state.agentRange, state.agentCustomStart, state.agentCustomEnd);
+  return text.replace(/^Window:\s*/, "");
 }
 
 function renderAgentWorkloadTable() {
@@ -691,50 +703,62 @@ function renderAgentWorkloadTable() {
   tbody.innerHTML = "";
   tfoot.innerHTML = "";
 
-  const weekCases = getAgentScopedCases();
-
-  // Only current queue members are listed
+  const base = getAgentBaseCases();
   const agentList = state.queueAgents || [];
+  const members = new Set(agentList);
 
-  const types = ["Incident", "Service Request", "Query", "Feature Request"];
+  // Count every case into exactly one row and one type column
+  const tally = {};
+  base.forEach((c) => {
+    const key = caseGroupKey(c, members);
+    const row = tally[key] || (tally[key] = { total: 0 });
+    row[c.type] = (row[c.type] || 0) + 1;
+    row.total++;
+  });
+
+  const rows = agentList.map((a) => ({ key: a, label: a, muted: false }));
+  if ((tally[UNASSIGNED_KEY] || {}).total > 0) {
+    rows.push({ key: UNASSIGNED_KEY, label: "Unassigned (still in queue)", muted: true });
+  }
+  if ((tally[OTHERS_KEY] || {}).total > 0) {
+    rows.push({ key: OTHERS_KEY, label: "Others (not on queue roster)", muted: true });
+  }
+
+  if (rows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: #888; padding: 15px;">No cases in this timeframe.</td></tr>`;
+    return;
+  }
+
   const pillClass = {
     Incident: "pill-low",
     "Service Request": "pill-medium",
     Query: "pill-high",
-    "Feature Request": "pill-critical"
+    "Feature Request": "pill-critical",
+    Other: "pill-other"
   };
-  const colTotals = { Incident: 0, "Service Request": 0, Query: 0, "Feature Request": 0, Total: 0 };
+  const colTotals = { Total: 0 };
+  AGENT_TYPES.forEach((t) => (colTotals[t] = 0));
 
-  if (agentList.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: #888; padding: 15px;">No queue members found.</td></tr>`;
-    return;
-  }
+  rows.forEach((row) => {
+    const counts = tally[row.key] || { total: 0 };
+    const safeKey = escapeHtml(row.key);
+    const safeLabel = escapeHtml(row.label);
 
-  agentList.forEach((agent) => {
-    let rowTotal = 0;
-    const counts = {};
+    AGENT_TYPES.forEach((t) => (colTotals[t] += counts[t] || 0));
+    colTotals.Total += counts.total;
 
-    types.forEach((t) => {
-      const cnt = weekCases.filter((c) => c.agent === agent && c.type === t).length;
-      counts[t] = cnt;
-      rowTotal += cnt;
-      colTotals[t] += cnt;
-    });
-    colTotals.Total += rowTotal;
-
-    const safeAgent = escapeHtml(agent);
     const typeCell = (t) =>
-      counts[t] > 0
-        ? `<td style="text-align: center;"><button type="button" class="pill ${pillClass[t]} drill-link" data-agent="${safeAgent}" data-type="${t}" title="View ${counts[t]} ${t} case(s) for ${safeAgent}">${counts[t]}</button></td>`
+      (counts[t] || 0) > 0
+        ? `<td style="text-align: center;"><button type="button" class="pill ${pillClass[t]} drill-link" data-agent="${safeKey}" data-type="${t}" title="View ${counts[t]} ${t} case(s) - ${safeLabel}">${counts[t]}</button></td>`
         : `<td style="text-align: center;">0</td>`;
 
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td><button type="button" class="agent-link" data-agent="${safeAgent}" title="View all tickets for ${safeAgent}">${safeAgent}</button></td>
-      ${types.map(typeCell).join("")}
+      <td><button type="button" class="agent-link${row.muted ? " agent-link-muted" : ""}" data-agent="${safeKey}" title="View all tickets - ${safeLabel}">${safeLabel}</button></td>
+      ${AGENT_TYPES.map(typeCell).join("")}
       <td style="text-align: center; font-weight: 700;">${
-        rowTotal > 0
-          ? `<button type="button" class="drill-link-total" data-agent="${safeAgent}" title="View all ${rowTotal} case(s) for ${safeAgent}">${rowTotal}</button>`
+        counts.total > 0
+          ? `<button type="button" class="drill-link-total" data-agent="${safeKey}" title="View all ${counts.total} case(s) - ${safeLabel}">${counts.total}</button>`
           : "0"
       }</td>
     `;
@@ -748,14 +772,150 @@ function renderAgentWorkloadTable() {
 
   tfoot.innerHTML = `
     <tr>
-      <td>Total Assigned</td>
-      ${footCell(colTotals["Incident"], "Incident")}
-      ${footCell(colTotals["Service Request"], "Service Request")}
-      ${footCell(colTotals["Query"], "Query")}
-      ${footCell(colTotals["Feature Request"], "Feature Request")}
+      <td>Total</td>
+      ${AGENT_TYPES.map((t) => footCell(colTotals[t], t)).join("")}
       ${footCell(colTotals.Total, "", "font-size: 15px;")}
     </tr>
   `;
+}
+
+// Line under the table: the window, the total, and whether it matches Total Inflow
+function renderAgentNote() {
+  // Keep the "Same as dashboard" option label in step with the dashboard timeframe
+  const sel = document.getElementById("agentTimeframeSelect");
+  if (sel && sel.options.length) {
+    const names = {
+      thisMonth: "Current Month",
+      lastMonth: "Last Calendar Month",
+      bothMonths: "Last & Current Months",
+      rolling30: "Rolling 30 Days",
+      custom: "Custom Range"
+    };
+    const t = state.timeRange;
+    const name = names[t] || (String(t).startsWith("pastWeek") ? `Past Week ${String(t).replace("pastWeek", "")}` : t);
+    sel.options[0].text = `Same as dashboard (${name})`;
+  }
+
+  const card = document.getElementById("agentWorkloadCard");
+  if (card) card.classList.toggle("agent-card-loading", !!state.agentLoading);
+
+  const el = document.getElementById("agentReconcile");
+  if (!el) return;
+
+  if (state.agentLoading) {
+    el.innerHTML = "Loading cases for this timeframe...";
+    return;
+  }
+  if (state.agentError) {
+    el.innerHTML = `<span class="custom-range-error">Could not load this timeframe: ${escapeHtml(state.agentError)}</span>`;
+    return;
+  }
+
+  const n = getAgentBaseCases().length;
+  const windowText = escapeHtml(getAgentWindowText());
+  el.innerHTML =
+    state.agentRange === "SAME"
+      ? `<strong>${n}</strong> cases &bull; ${windowText} &bull; &#10003; Matches Total Inflow above`
+      : `<strong>${n}</strong> cases &bull; ${windowText} &bull; Different timeframe from the dashboard, so this total can differ from Total Inflow`;
+}
+
+async function loadAgentCases() {
+  if (state.agentLoadController) state.agentLoadController.abort();
+  state.agentLoadController = null;
+
+  if (state.agentRange === "SAME") {
+    state.agentCases = null;
+    state.agentLoading = false;
+    state.agentError = "";
+    renderAgentWorkloadTable();
+    renderAgentNote();
+    return;
+  }
+
+  const controller = new AbortController();
+  state.agentLoadController = controller;
+  state.agentLoading = true;
+  state.agentError = "";
+  renderAgentNote();
+
+  try {
+    let url = `/api/queue-inflow?queueName=${encodeURIComponent(state.queueName)}&range=${state.agentRange}`;
+    if (state.agentRange === "custom") {
+      url += `&start=${state.agentCustomStart}&end=${state.agentCustomEnd}`;
+    }
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      let msg = `HTTP ${response.status}`;
+      try {
+        const body = await response.json();
+        if (body && body.error) msg = body.error;
+      } catch (e) { /* keep the HTTP status */ }
+      throw new Error(msg);
+    }
+    const data = await response.json();
+    if (!data.records || !Array.isArray(data.records)) throw new Error("Invalid response payload structure");
+    state.agentCases = data.records.map(mapRecord);
+  } catch (err) {
+    if (err.name === "AbortError") return; // superseded by a newer request
+    state.agentCases = [];
+    state.agentError = err.message;
+  }
+
+  if (state.agentLoadController === controller) {
+    state.agentLoadController = null;
+    state.agentLoading = false;
+    renderAgentWorkloadTable();
+    renderAgentNote();
+  }
+}
+
+function setupAgentTimeframeListeners() {
+  const select = document.getElementById("agentTimeframeSelect");
+  if (!select) return;
+  const controls = document.getElementById("agentCustomControls");
+  const startInput = document.getElementById("agentCustomStartDate");
+  const endInput = document.getElementById("agentCustomEndDate");
+  const errorElem = document.getElementById("agentCustomError");
+  const applyBtn = document.getElementById("applyAgentCustomBtn");
+
+  const toISODate = (d) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  if (startInput && endInput) {
+    const today = toISODate(new Date());
+    startInput.max = today;
+    endInput.max = today;
+  }
+
+  select.addEventListener("change", async (e) => {
+    if (e.target.value === "custom") {
+      // Wait for Apply; keep the current table on screen until then
+      if (controls) controls.hidden = false;
+      if (startInput) startInput.focus();
+      return;
+    }
+    if (controls) controls.hidden = true;
+    if (errorElem) errorElem.textContent = "";
+    state.agentRange = e.target.value;
+    await loadAgentCases();
+  });
+
+  if (applyBtn) {
+    applyBtn.addEventListener("click", async () => {
+      const s = startInput.value;
+      const e = endInput.value;
+      errorElem.textContent = "";
+
+      if (!s || !e) { errorElem.textContent = "Pick both a start and an end date."; return; }
+      if (s > e) { errorElem.textContent = "Start date must be on or before the end date."; return; }
+      const days = (parseLocalDate(e) - parseLocalDate(s)) / 86400000 + 1;
+      if (days > 365) { errorElem.textContent = "Range cannot exceed 365 days."; return; }
+
+      state.agentRange = "custom";
+      state.agentCustomStart = s;
+      state.agentCustomEnd = e;
+      await loadAgentCases();
+    });
+  }
 }
 
 function renderTable() {
@@ -824,7 +984,7 @@ function renderTable() {
       <td>${caseNumberHtml(c)}</td>
       <td>${escapeHtml(c.subject)}</td>
       <td><strong>${escapeHtml(c.agent)}</strong></td>
-      <td><span class="pill pill-medium">${escapeHtml(c.type)}</span></td>
+      <td><span class="pill pill-medium">${escapeHtml(typeLabel(c))}</span></td>
       <td><span class="pill pill-${pClass}">${escapeHtml(c.priority)}</span></td>
       <td>${escapeHtml(c.origin)}</td>
       <td>
@@ -837,28 +997,34 @@ function renderTable() {
   });
 }
 
-function applyFilters() {
+function getFilterCriteria() {
   const searchInput = document.getElementById("searchInput");
   const priorityFilter = document.getElementById("priorityFilter");
   const originFilter = document.getElementById("originFilter");
 
-  const term = (searchInput ? searchInput.value : "").toLowerCase();
-  const selPriority = priorityFilter ? priorityFilter.value : "ALL";
-  const selOrigin = originFilter ? originFilter.value : "ALL";
+  return {
+    term: (searchInput ? searchInput.value : "").toLowerCase(),
+    selPriority: priorityFilter ? priorityFilter.value : "ALL",
+    selOrigin: originFilter ? originFilter.value : "ALL"
+  };
+}
 
-  state.filteredCases = state.cases.filter((c) => {
-    const matchesTab = state.selectedTab === "ALL" || c.type === state.selectedTab;
-    const matchesSearch =
-      c.caseNumber.toLowerCase().includes(term) ||
-      c.subject.toLowerCase().includes(term) ||
-      c.agent.toLowerCase().includes(term) ||
-      c.type.toLowerCase().includes(term);
-    const matchesPriority = selPriority === "ALL" || (c.priority || "").toLowerCase() === selPriority.toLowerCase();
-    const matchesOrigin = selOrigin === "ALL" || (c.origin || "").toLowerCase() === selOrigin.toLowerCase();
+function caseMatchesFilters(c, f) {
+  const matchesTab = state.selectedTab === "ALL" || c.type === state.selectedTab;
+  const matchesSearch =
+    c.caseNumber.toLowerCase().includes(f.term) ||
+    c.subject.toLowerCase().includes(f.term) ||
+    c.agent.toLowerCase().includes(f.term) ||
+    c.type.toLowerCase().includes(f.term);
+  const matchesPriority = f.selPriority === "ALL" || (c.priority || "").toLowerCase() === f.selPriority.toLowerCase();
+  const matchesOrigin = f.selOrigin === "ALL" || (c.origin || "").toLowerCase() === f.selOrigin.toLowerCase();
 
-    return matchesTab && matchesSearch && matchesPriority && matchesOrigin;
-  });
+  return matchesTab && matchesSearch && matchesPriority && matchesOrigin;
+}
 
+function applyFilters() {
+  const f = getFilterCriteria();
+  state.filteredCases = state.cases.filter((c) => caseMatchesFilters(c, f));
   renderDashboard();
 }
 
@@ -878,14 +1044,6 @@ function setupEventListeners() {
       state.selectedStatusFilter = e.target.value;
       renderTable();
       renderStatusChart();
-    });
-  }
-
-  const weekSelect = document.getElementById("agentWeekSelect");
-  if (weekSelect) {
-    weekSelect.addEventListener("change", (e) => {
-      state.selectedWeek = e.target.value;
-      renderAgentWorkloadTable();
     });
   }
 
@@ -971,6 +1129,7 @@ function setupEventListeners() {
     refreshBtn.addEventListener("click", () => loadDashboardData());
   }
 
+  setupAgentTimeframeListeners();
   setupDrillDownListeners();
 
   const exportBtn = document.getElementById("exportCsvBtn");
@@ -995,7 +1154,6 @@ function handleFileUpload(event) {
       } else {
         parseCSV(content);
       }
-      populateWeekSelectOptions();
       populateStatusFilterOptions();
       alert(`Imported ${state.cases.length} records successfully.`);
     } catch (err) {
@@ -1088,7 +1246,7 @@ function downloadCasesCsv(cases, filename) {
         c.caseNumber,
         c.subject,
         c.agent || "Unassigned",
-        c.type,
+        typeLabel(c),
         c.priority,
         c.origin,
         c.routedDate.toISOString(),
@@ -1115,7 +1273,7 @@ function downloadCasesCsv(cases, filename) {
  * ========================================================================= */
 
 const DRILL_ROW_LIMIT = 500;
-const DRILL_TYPE_ORDER = ["Incident", "Service Request", "Query", "Feature Request"];
+const DRILL_TYPE_ORDER = ["Incident", "Service Request", "Query", "Feature Request", "Other"];
 
 function setupDrillDownListeners() {
   // KPI cards
@@ -1269,21 +1427,20 @@ function openKpiDrill(kind) {
   openDrill(title, subtitle, cases);
 }
 
-function openAgentDrill(agent, type) {
-  // Same population the workload table counts: queue members only, within the selected week
+function openAgentDrill(key, type) {
   const members = new Set(state.queueAgents || []);
-  const cases = getAgentScopedCases().filter(
-    (c) => members.has(c.agent) && (!agent || c.agent === agent) && (!type || c.type === type)
+  const cases = getAgentBaseCases().filter(
+    (c) => (!key || caseGroupKey(c, members) === key) && (!type || c.type === type)
   );
 
-  const weekSelect = document.getElementById("agentWeekSelect");
-  const weekText =
-    weekSelect && weekSelect.selectedIndex >= 0 ? weekSelect.options[weekSelect.selectedIndex].text : "";
-
-  let title = agent || "All Queue Agents";
+  let title;
+  if (key === UNASSIGNED_KEY) title = "Unassigned cases";
+  else if (key === OTHERS_KEY) title = "Cases owned by people outside the queue roster";
+  else title = key || "All cases";
   if (type) title += ` — ${type}`;
+
   const noun = cases.length === 1 ? "case" : "cases";
-  openDrill(title, `${cases.length} ${noun} • Week: ${weekText}`, cases);
+  openDrill(title, `${cases.length} ${noun} • ${getAgentWindowText()}`, cases);
 }
 
 function openDrill(title, subtitle, cases) {
@@ -1328,7 +1485,7 @@ function getDrillVisibleCases() {
   const list = d.cases.filter((c) => {
     if (d.type !== "ALL" && c.type !== d.type) return false;
     if (!term) return true;
-    return [c.caseNumber, c.subject, c.agent, c.type, c.status, c.priority].some((v) =>
+    return [c.caseNumber, c.subject, c.agent, c.type, c.rawType, c.status, c.priority].some((v) =>
       String(v || "").toLowerCase().includes(term)
     );
   });
@@ -1418,7 +1575,7 @@ function renderDrill() {
           <td class="drill-nowrap">${caseNumberHtml(c)}</td>
           <td class="drill-subject">${escapeHtml(c.subject)}</td>
           <td class="drill-nowrap">${escapeHtml(c.agent)}</td>
-          <td class="drill-nowrap"><span class="pill ${typeClass}">${escapeHtml(c.type)}</span></td>
+          <td class="drill-nowrap"><span class="pill ${typeClass}">${escapeHtml(typeLabel(c))}</span></td>
           <td class="drill-nowrap"><span class="pill pill-${pClass}">${escapeHtml(c.priority)}</span></td>
           <td class="drill-nowrap">${escapeHtml(c.status)}</td>
           <td class="drill-nowrap">${escapeHtml(c.routedDate.toLocaleString("en-US", dateOpts))} ${ageHtml}</td>
