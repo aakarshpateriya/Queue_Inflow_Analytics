@@ -89,9 +89,6 @@
       <button class="tab-nav-btn" data-tab="Service Request">
         Service Requests <span class="tab-badge" id="badgeSR">0</span>
       </button>
-      <button class="tab-nav-btn" data-tab="Query">
-        Queries <span class="tab-badge" id="badgeQuery">0</span>
-      </button>
       <button class="tab-nav-btn" data-tab="Feature Request">
         Feature Requests <span class="tab-badge" id="badgeFR">0</span>
       </button>
@@ -231,7 +228,6 @@
                 <th style="width: 25%;">Queue Agent</th>
                 <th style="text-align: center;">Incident</th>
                 <th style="text-align: center;">Service Request</th>
-                <th style="text-align: center;">Query</th>
                 <th style="text-align: center;">Feature Request</th>
                 <th style="text-align: center;">Other</th>
                 <th style="text-align: center; font-weight: 700;">Total Handled</th>
@@ -257,6 +253,18 @@
               <option value="ACTIVE" selected>Status: Active (New / Assigned)</option>
               <option value="ALL">Status: All (View All Cases)</option>
             </select>
+
+            <!-- Ticket type and tool type filters for the list -->
+            <select id="typeFilter" class="table-filter" style="font-weight: 600;">
+              <option value="ALL" selected>Type: All</option>
+              <option value="Incident">Type: Incident</option>
+              <option value="Service Request">Type: Service Request</option>
+              <option value="Feature Request">Type: Feature Request</option>
+              <option value="Other">Type: Other</option>
+            </select>
+            <select id="toolFilter" class="table-filter" style="font-weight: 600;">
+              <option value="ALL" selected>Tool Type: All</option>
+            </select>
           </div>
 
           <div style="display: flex; align-items: center; gap: 10px;">
@@ -276,6 +284,7 @@
                 <th>Subject</th>
                 <th>Assigned Agent</th>
                 <th>Type</th>
+                <th>Tool Type</th>
                 <th>Priority</th>
                 <th>Origin</th>
                 <th>Age / Routed</th>
@@ -317,6 +326,7 @@
               <th data-sort="subject" tabindex="0">Subject</th>
               <th data-sort="agent" tabindex="0">Assigned Agent</th>
               <th data-sort="type" tabindex="0">Type</th>
+              <th data-sort="toolType" tabindex="0">Tool Type</th>
               <th data-sort="priority" tabindex="0">Priority</th>
               <th data-sort="status" tabindex="0">Status</th>
               <th data-sort="routedDate" tabindex="0">Routed / Age</th>
@@ -333,6 +343,6 @@
   </div>
 
   <!-- Cache-busting script tag -->
-  <script src="app.js?v=3.7"></script>
+  <script src="app.js?v=3.9"></script>
 </body>
 </html>

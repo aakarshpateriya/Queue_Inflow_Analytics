@@ -1,6 +1,7 @@
 // server.js
 process.env.TZ = 'Asia/Kolkata'; // Align Node.js to Salesforce Org timezone (IST)
 const path = require('path');
+const crypto = require('crypto');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
@@ -12,11 +13,38 @@ const HOST = '0.0.0.0';
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(__dirname));
+
+// Page files live in public/. Vercel serves that folder itself; this line is for running locally.
+// (Serving __dirname would also publish server.js, package.json and friends.)
+app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
+
+// Optional password for the data API. Set DASHBOARD_PASSWORD (and optionally DASHBOARD_USER) to turn it on;
+// leave it unset for local use. The browser will ask for the login the first time the dashboard loads data.
+const { DASHBOARD_USER = 'admin', DASHBOARD_PASSWORD } = process.env;
+
+function requireLogin(req, res, next) {
+  if (!DASHBOARD_PASSWORD) return next();
+
+  const [scheme, encoded] = (req.headers.authorization || '').split(' ');
+  if (scheme === 'Basic' && encoded) {
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const sep = decoded.indexOf(':');
+    const user = decoded.slice(0, sep);
+    const pass = decoded.slice(sep + 1);
+    const sha = (v) => crypto.createHash('sha256').update(String(v)).digest();
+    const userOk = crypto.timingSafeEqual(sha(user), sha(DASHBOARD_USER));
+    const passOk = crypto.timingSafeEqual(sha(pass), sha(DASHBOARD_PASSWORD));
+    if (userOk && passOk) return next();
+  }
+
+  res.set('WWW-Authenticate', 'Basic realm="Queue Inflow Analytics"');
+  return res.status(401).json({ success: false, error: 'Login required' });
+}
+app.use('/api', requireLogin);
 
 const {
   SF_LOGIN_URL = 'https://greyorangeorg.my.salesforce.com',
@@ -65,6 +93,23 @@ const responseCache = {
 };
 
 const inFlightRequests = new Map();
+
+// On Vercel a function can be frozen as soon as the response is sent. waitUntil (from the optional
+// @vercel/functions package) keeps it alive until the background refresh finishes. Safe to leave uninstalled.
+let vercelWaitUntil = null;
+try {
+  ({ waitUntil: vercelWaitUntil } = require('@vercel/functions'));
+} catch (e) {
+  /* not installed: background refreshes still run wherever the process stays alive */
+}
+const keepAlive = (promise) => {
+  if (!vercelWaitUntil) return;
+  try {
+    vercelWaitUntil(promise);
+  } catch (e) {
+    /* not running on Vercel */
+  }
+};
 
 async function getSalesforceConnection(forceRefresh = false) {
   if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) {
@@ -134,10 +179,11 @@ async function getCaseTypeFields(conn) {
       hasTicketType: fieldNames.has('Ticket_Type__c'),
       hasCaseType: fieldNames.has('Case_Type__c'),
       hasCategory: fieldNames.has('Category__c'),
+      hasToolsPlatform: fieldNames.has('Tools_Platform__c'), // "Tool Type" picklist (automation tickets)
     };
     return caseFieldsCache;
   } catch (err) {
-    return { hasRecordType: false, hasTicketType: false, hasCaseType: false, hasCategory: false };
+    return { hasRecordType: false, hasTicketType: false, hasCaseType: false, hasCategory: false, hasToolsPlatform: false };
   }
 }
 
@@ -452,6 +498,7 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
     if (schemaFields.hasTicketType) extraCols.push('Ticket_Type__c');
     if (schemaFields.hasCaseType) extraCols.push('Case_Type__c');
     if (schemaFields.hasCategory) extraCols.push('Category__c');
+    if (schemaFields.hasToolsPlatform) extraCols.push('Tools_Platform__c');
 
     const selectClause = [
       'Id', 'CaseNumber', 'Subject', 'Status', 'Automation_Priority__c', 'Type',
@@ -507,6 +554,7 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
         Status: c.Status,
         Automation_Priority__c: c.Automation_Priority__c || 'Medium',
         Type: normalizeType(rawT, c.Subject),
+        Tools_Platform__c: c.Tools_Platform__c || null,
         CreatedDate: c.CreatedDate,
       });
     });
@@ -589,6 +637,7 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
             Status: c.Status,
             Automation_Priority__c: c.Automation_Priority__c || 'Medium',
             Type: normalizeType(rawT, c.Subject),
+            Tools_Platform__c: c.Tools_Platform__c || null,
             CreatedDate: caseInflowTimestamps.get(c.Id) || c.CreatedDate,
           });
         });
@@ -752,7 +801,10 @@ async function fetchInflowData(queueName = SF_QUEUE_NAME, spec = resolveRange({}
     if (entry) {
       // Stale data is still served instantly; refresh quietly in the background
       if (!entry.fresh) {
-        startFetch(queueName, spec.scope).catch((err) => console.warn('[BACKGROUND REFRESH WARNING]', err.message));
+        const refresh = startFetch(queueName, spec.scope).catch((err) =>
+          console.warn('[BACKGROUND REFRESH WARNING]', err.message)
+        );
+        keepAlive(refresh);
       }
       return applyRangeFilter(entry.data, spec);
     }
@@ -807,23 +859,33 @@ async function prewarmCache() {
   }
 }
 
-// Keep the cache fresh every 2 minutes (one fetch covers every range; never overlaps itself)
-let syncRunning = false;
-setInterval(async () => {
-  if (syncRunning) return;
-  syncRunning = true;
-  try {
-    await startFetch(SF_QUEUE_NAME, 'bothMonths');
-  } catch (err) {
-    console.warn('[SYNC WARNING]', err.message);
-  } finally {
-    syncRunning = false;
-  }
-}, 2 * 60 * 1000);
+// ---------------------------------------------------------------------------
+// Start-up
+// ---------------------------------------------------------------------------
+// Locally (node server.js / npm start) this is a long-running server: it listens, warms the cache and
+// refreshes it every 2 minutes. On Vercel the app is exported instead and each request runs inside a
+// serverless function, so there is no listener, timer or pre-warm (the cache fills on the first request).
+if (require.main === module && !process.env.VERCEL) {
+  // Keep the cache fresh every 2 minutes (one fetch covers every range; never overlaps itself)
+  let syncRunning = false;
+  setInterval(async () => {
+    if (syncRunning) return;
+    syncRunning = true;
+    try {
+      await startFetch(SF_QUEUE_NAME, 'bothMonths');
+    } catch (err) {
+      console.warn('[SYNC WARNING]', err.message);
+    } finally {
+      syncRunning = false;
+    }
+  }, 2 * 60 * 1000);
 
-app.listen(PORT, HOST, () => {
-  console.log(`=========================================`);
-  console.log(`Production Server listening on port ${PORT} [TZ: ${process.env.TZ}]`);
-  console.log(`=========================================`);
-  prewarmCache();
-});
+  app.listen(PORT, HOST, () => {
+    console.log(`=========================================`);
+    console.log(`Production Server listening on port ${PORT} [TZ: ${process.env.TZ}]`);
+    console.log(`=========================================`);
+    prewarmCache();
+  });
+}
+
+module.exports = app;

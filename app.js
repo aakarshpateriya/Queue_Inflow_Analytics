@@ -9,6 +9,8 @@ const state = {
   customEnd: null,   // YYYY-MM-DD, used when timeRange === "custom"
   selectedTab: "ALL",
   selectedStatusFilter: "ACTIVE", // Default view remains Active (New / Assigned)
+  selectedTypeFilter: "ALL", // ticket type dropdown above the cases list
+  selectedToolFilter: "ALL", // tool type dropdown above the cases list
   queueAgents: [],
   weeklyBifurcation: null,
   cases: [],
@@ -132,7 +134,14 @@ async function loadDashboardData() {
     }
     const response = await fetch(url, { signal: controller.signal });
 
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      let msg = `HTTP ${response.status}`;
+      try {
+        const body = await response.json();
+        if (body && body.error) msg = body.error;
+      } catch (e) { /* keep the HTTP status */ }
+      throw new Error(msg);
+    }
     const data = await response.json();
 
     if (data.records && Array.isArray(data.records)) {
@@ -141,6 +150,7 @@ async function loadDashboardData() {
       state.instanceUrl = typeof data.instanceUrl === "string" && /^https:\/\//.test(data.instanceUrl) ? data.instanceUrl : null;
       mapIncomingRecords(data.records);
       populateStatusFilterOptions();
+      populateToolFilterOptions();
       state.isLiveApiConnected = true;
       if (state.agentRange !== "SAME") loadAgentCases();
       return;
@@ -150,6 +160,9 @@ async function loadDashboardData() {
     if (err.name === "AbortError") return; // superseded by a newer request
     console.warn("Could not retrieve live Salesforce data:", err.message);
     state.isLiveApiConnected = false;
+    // Say so on the page instead of leaving it looking empty
+    const labelElem = document.getElementById("dateRangeText");
+    if (labelElem) labelElem.textContent = `Could not load data (${err.message}). Click Refresh to try again.`;
   } finally {
     if (state.loadController === controller) {
       state.loadController = null;
@@ -194,7 +207,8 @@ function normalizeType(rawType, subject = '') {
   return rawType || 'Incident';
 }
 
-const CORE_TYPES = ["Incident", "Service Request", "Query", "Feature Request"];
+// "Query" is not tracked on this dashboard: a query-type case is counted under "Other"
+const CORE_TYPES = ["Incident", "Service Request", "Feature Request"];
 
 // Anything that is not one of the four standard types goes into "Other" (raw value is kept in rawType)
 function canonicalType(rawType, subject) {
@@ -214,6 +228,7 @@ function mapRecord(r, i) {
     subject: r.Subject || "(No Subject)",
     agent: r.agent && r.agent !== "Unassigned" && r.agent !== "Admin Queue" ? r.agent : "Unassigned",
     rawType: String(rawTypeValue || "").trim(),
+    toolType: String(r.Tools_Platform__c || "").trim(), // "Tool Type" picklist (automation tickets only)
     type: canonicalType(rawTypeValue, r.Subject),
     priority: r.Automation_Priority__c || r.Priority || "Medium",
     origin: r.Origin || "Portal",
@@ -233,7 +248,7 @@ function mapIncomingRecords(raw) {
 }
 
 function updateTabBadges() {
-  const counts = { ALL: state.cases.length, Incident: 0, "Service Request": 0, Query: 0, "Feature Request": 0, Other: 0 };
+  const counts = { ALL: state.cases.length, Incident: 0, "Service Request": 0, "Feature Request": 0, Other: 0 };
   state.cases.forEach((c) => {
     if (counts[c.type] !== undefined) counts[c.type]++;
   });
@@ -246,7 +261,6 @@ function updateTabBadges() {
   setBadge("badgeAll", counts.ALL);
   setBadge("badgeIncident", counts.Incident);
   setBadge("badgeSR", counts["Service Request"]);
-  setBadge("badgeQuery", counts.Query);
   setBadge("badgeFR", counts["Feature Request"]);
   setBadge("badgeOther", counts.Other);
 
@@ -290,6 +304,53 @@ function getTimeWindow() {
 function parseLocalDate(iso) {
   const [y, m, d] = iso.split("-").map(Number);
   return new Date(y, m - 1, d);
+}
+
+// Tool Type picklist values (Case.Tools_Platform__c); anything else found in the data is added automatically
+const TOOL_TYPES = ["Salesforce", "Oneuptime", "Ace-academy", "Critsit", "Automation Deliverables", "Others"];
+const NO_TOOL = "__NO_TOOL__";
+
+function populateToolFilterOptions() {
+  const select = document.getElementById("toolFilter");
+  if (!select) return;
+
+  const known = new Set(TOOL_TYPES.map((t) => t.toLowerCase()));
+  const extras = new Set();
+  state.cases.forEach((c) => {
+    const v = (c.toolType || "").trim();
+    if (v && !known.has(v.toLowerCase())) extras.add(v);
+  });
+  const values = TOOL_TYPES.concat(Array.from(extras).sort());
+
+  select.innerHTML =
+    `<option value="ALL">Tool Type: All</option>` +
+    values.map((v) => `<option value="${escapeHtml(v)}">Tool Type: ${escapeHtml(v)}</option>`).join("") +
+    `<option value="${NO_TOOL}">Tool Type: Not set</option>`;
+
+  const keep =
+    state.selectedToolFilter === "ALL" || state.selectedToolFilter === NO_TOOL || values.includes(state.selectedToolFilter);
+  select.value = keep ? state.selectedToolFilter : "ALL";
+  state.selectedToolFilter = select.value;
+}
+
+// Applies the Type and Tool Type dropdowns above the cases list
+function matchesTypeAndTool(c) {
+  if (state.selectedTypeFilter !== "ALL" && c.type !== state.selectedTypeFilter) return false;
+
+  const tool = state.selectedToolFilter;
+  if (tool !== "ALL") {
+    const v = (c.toolType || "").trim().toLowerCase();
+    if (tool === NO_TOOL) {
+      if (v) return false;
+    } else if (v !== tool.toLowerCase()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function toolTypeHtml(c) {
+  return c.toolType ? escapeHtml(c.toolType) : `<span class="muted-age">&mdash;</span>`;
 }
 
 function populateStatusFilterOptions() {
@@ -689,7 +750,7 @@ function typeLabel(c) {
 
 const UNASSIGNED_KEY = "__UNASSIGNED__";
 const OTHERS_KEY = "__OTHERS__";
-const AGENT_TYPES = ["Incident", "Service Request", "Query", "Feature Request", "Other"];
+const AGENT_TYPES = ["Incident", "Service Request", "Feature Request", "Other"];
 
 function caseGroupKey(c, members) {
   if (c.agent === "Unassigned") return UNASSIGNED_KEY;
@@ -740,14 +801,13 @@ function renderAgentWorkloadTable() {
   }
 
   if (rows.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: #888; padding: 15px;">No cases in this timeframe.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: #888; padding: 15px;">No cases in this timeframe.</td></tr>`;
     return;
   }
 
   const pillClass = {
     Incident: "pill-low",
     "Service Request": "pill-medium",
-    Query: "pill-high",
     "Feature Request": "pill-critical",
     Other: "pill-other"
   };
@@ -970,6 +1030,8 @@ function renderTable() {
     }
   }
 
+  displayedCases = displayedCases.filter(matchesTypeAndTool);
+
   const countElem = document.getElementById("recordCountText");
   if (countElem) {
     let filterDesc = "New / Assigned";
@@ -977,13 +1039,16 @@ function renderTable() {
     else if (state.selectedStatusFilter && state.selectedStatusFilter !== "ACTIVE") {
       filterDesc = `Status: ${state.selectedStatusFilter}`;
     }
+    if (state.selectedTypeFilter !== "ALL") filterDesc += ` • Type: ${state.selectedTypeFilter}`;
+    if (state.selectedToolFilter === NO_TOOL) filterDesc += " • Tool Type: Not set";
+    else if (state.selectedToolFilter !== "ALL") filterDesc += ` • Tool Type: ${state.selectedToolFilter}`;
     countElem.textContent = `Showing ${Math.min(200, displayedCases.length)} of ${displayedCases.length} (${filterDesc})`;
   }
 
   const displayList = displayedCases.slice(0, 200);
 
   if (displayList.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: #888; padding: 25px;">No cases found matching the active filters.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" style="text-align: center; color: #888; padding: 25px;">No cases found matching the active filters.</td></tr>`;
     return;
   }
 
@@ -993,13 +1058,15 @@ function renderTable() {
     const tr = document.createElement("tr");
     const pClass = String(c.priority || "medium").toLowerCase().replace(/[^a-z0-9_-]/g, "");
     const ageHours = Math.floor((nowMs - c.routedDate.getTime()) / (1000 * 60 * 60));
-    const isAgingBreach = ageHours >= 24;
+    // Only open cases (New / Assigned) can breach the 24h rule; solved or on-hold ones are just old
+    const isAgingBreach = isOpenStatus(c.status) && ageHours >= 24;
 
     tr.innerHTML = `
       <td>${caseNumberHtml(c)}</td>
       <td>${escapeHtml(c.subject)}</td>
       <td><strong>${escapeHtml(c.agent)}</strong></td>
       <td><span class="pill pill-medium">${escapeHtml(typeLabel(c))}</span></td>
+      <td>${toolTypeHtml(c)}</td>
       <td><span class="pill pill-${pClass}">${escapeHtml(c.priority)}</span></td>
       <td>${escapeHtml(c.origin)}</td>
       <td>
@@ -1150,6 +1217,24 @@ function setupEventListeners() {
     refreshBtn.addEventListener("click", () => loadDashboardData());
   }
 
+  populateToolFilterOptions();
+
+  const typeFilterEl = document.getElementById("typeFilter");
+  if (typeFilterEl) {
+    typeFilterEl.addEventListener("change", (e) => {
+      state.selectedTypeFilter = e.target.value;
+      renderTable();
+    });
+  }
+
+  const toolFilterEl = document.getElementById("toolFilter");
+  if (toolFilterEl) {
+    toolFilterEl.addEventListener("change", (e) => {
+      state.selectedToolFilter = e.target.value;
+      renderTable();
+    });
+  }
+
   setupAgentTimeframeListeners();
   setupDrillDownListeners();
 
@@ -1176,6 +1261,7 @@ function handleFileUpload(event) {
         parseCSV(content);
       }
       populateStatusFilterOptions();
+      populateToolFilterOptions();
       alert(`Imported ${state.cases.length} records successfully.`);
     } catch (err) {
       alert("Error reading file: " + err.message);
@@ -1209,9 +1295,10 @@ function exportToCSV() {
     return s === "new" || s === "assigned";
   });
 
+  const exported = activeCases.filter(matchesTypeAndTool);
   const rangeTag =
     state.timeRange === "custom" ? `${state.customStart}_to_${state.customEnd}` : state.timeRange;
-  downloadCasesCsv(activeCases, `queue_backlog_${slugify(state.selectedTab)}_${rangeTag}.csv`);
+  downloadCasesCsv(exported, `queue_backlog_${slugify(state.selectedTab)}_${rangeTag}.csv`);
 }
 
 /* =========================================================================
@@ -1256,7 +1343,7 @@ function csvCell(value) {
 }
 
 function downloadCasesCsv(cases, filename) {
-  const headers = ["CaseNumber", "Subject", "Assigned Agent", "Type", "Priority", "Origin", "RoutedDate", "AgeHours", "Status"];
+  const headers = ["CaseNumber", "Subject", "Assigned Agent", "Type", "Tool Type", "Priority", "Origin", "RoutedDate", "AgeHours", "Status"];
   const nowMs = Date.now();
 
   const lines = [headers.map(csvCell).join(",")];
@@ -1268,6 +1355,7 @@ function downloadCasesCsv(cases, filename) {
         c.subject,
         c.agent || "Unassigned",
         typeLabel(c),
+        c.toolType || "",
         c.priority,
         c.origin,
         c.routedDate.toISOString(),
@@ -1294,7 +1382,7 @@ function downloadCasesCsv(cases, filename) {
  * ========================================================================= */
 
 const DRILL_ROW_LIMIT = 500;
-const DRILL_TYPE_ORDER = ["Incident", "Service Request", "Query", "Feature Request", "Other"];
+const DRILL_TYPE_ORDER = ["Incident", "Service Request", "Feature Request", "Other"];
 
 function setupDrillDownListeners() {
   // KPI cards
@@ -1506,7 +1594,7 @@ function getDrillVisibleCases() {
   const list = d.cases.filter((c) => {
     if (d.type !== "ALL" && c.type !== d.type) return false;
     if (!term) return true;
-    return [c.caseNumber, c.subject, c.agent, c.type, c.rawType, c.status, c.priority].some((v) =>
+    return [c.caseNumber, c.subject, c.agent, c.type, c.rawType, c.toolType, c.status, c.priority].some((v) =>
       String(v || "").toLowerCase().includes(term)
     );
   });
@@ -1574,7 +1662,7 @@ function renderDrill() {
   if (!tbody) return;
 
   if (shown.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: #888; padding: 25px;">No cases match.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: #888; padding: 25px;">No cases match.</td></tr>`;
     return;
   }
 
@@ -1595,12 +1683,13 @@ function renderDrill() {
         <tr>
           <td class="drill-nowrap">${caseNumberHtml(c)}</td>
           <td class="drill-subject">${escapeHtml(c.subject)}</td>
-          <td class="drill-nowrap">${escapeHtml(c.agent)}</td>
+          <td>${escapeHtml(c.agent)}</td>
           <td class="drill-nowrap"><span class="pill ${typeClass}">${escapeHtml(typeLabel(c))}</span></td>
+          <td>${toolTypeHtml(c)}</td>
           <td class="drill-nowrap"><span class="pill pill-${pClass}">${escapeHtml(c.priority)}</span></td>
-          <td class="drill-nowrap">${escapeHtml(c.status)}</td>
+          <td>${escapeHtml(c.status)}</td>
           <td class="drill-nowrap">${escapeHtml(c.routedDate.toLocaleString("en-US", dateOpts))} ${ageHtml}</td>
         </tr>`;
     })
     .join("");
- }
+}

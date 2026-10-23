@@ -650,7 +650,8 @@ body {
 .drill-table th.sorted-asc::after { content: " \25B2"; font-size: 0.65rem; }
 .drill-table th.sorted-desc::after { content: " \25BC"; font-size: 0.65rem; }
 
-.drill-subject { min-width: 260px; max-width: 520px; word-break: break-word; }
+.drill-subject { min-width: 190px; max-width: 460px; word-break: break-word; }
+.drill-table th, .drill-table td { padding: 0.6rem 0.7rem; }
 .drill-nowrap { white-space: nowrap; }
 .muted-age { color: var(--sf-text-muted); font-size: 0.75rem; margin-left: 4px; }
 
@@ -719,3 +720,12 @@ body {
 
 /* Jump-to-cases: leave room for the sticky header so the list's toolbar isn't hidden under it */
 .table-section { scroll-margin-top: 96px; }
+
+/* Cases list toolbar: search + Status / Type / Tool Type dropdowns on one line, count on the right
+   (the count drops below only when the screen is too narrow for everything) */
+.table-toolbar { flex-wrap: wrap; gap: 10px 16px; }
+.table-search-group { flex: 1 1 auto; max-width: none; flex-wrap: wrap; }
+.table-search-group .table-search { flex: 1 1 180px; min-width: 180px; max-width: 280px; }
+.table-search-group .table-filter { flex: 0 0 auto; }
+.table-toolbar .record-count { white-space: nowrap; }
+.table-toolbar > div:last-child { margin-left: auto; }
