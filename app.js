@@ -61,6 +61,10 @@ const FALLBACK_VIBRANT_COLORS = [
 ];
 
 document.addEventListener("DOMContentLoaded", async () => {
+  // Snappier charts: the default 1-second animation runs on every redraw
+  if (typeof Chart !== "undefined" && Chart.defaults && Chart.defaults.animation) {
+    Chart.defaults.animation.duration = 200;
+  }
   setupEventListeners();
   updateDateRangeLabel();
   await loadDashboardData();
@@ -596,6 +600,9 @@ function renderStatusChart() {
 
           renderTable();
           renderStatusChart();
+
+          // A status was picked (not cleared): bring the matching cases into view
+          if (state.selectedStatusFilter !== "ACTIVE") scrollToCases();
         }
       },
       plugins: {
@@ -621,6 +628,14 @@ function renderStatusChart() {
       }
     }
   });
+}
+
+// Smoothly scrolls the page down to the cases list (the sticky header is allowed for in CSS)
+function scrollToCases() {
+  const target = document.querySelector(".table-section") || document.getElementById("casesTableBody");
+  if (!target) return;
+  const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  target.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
 }
 
 function renderHourlyCurveChart() {
@@ -1105,7 +1120,13 @@ function setupEventListeners() {
   }
 
   const searchInput = document.getElementById("searchInput");
-  if (searchInput) searchInput.addEventListener("input", applyFilters);
+  if (searchInput) {
+    let searchTimer = null;
+    searchInput.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(applyFilters, 200);
+    });
+  }
 
   const priorityFilter = document.getElementById("priorityFilter");
   if (priorityFilter) priorityFilter.addEventListener("change", applyFilters);
@@ -1582,4 +1603,4 @@ function renderDrill() {
         </tr>`;
     })
     .join("");
-}
+ }

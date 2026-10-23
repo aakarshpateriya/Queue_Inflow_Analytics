@@ -29,24 +29,34 @@ let cachedConn = null;
 let cachedQueue = null;
 let caseFieldsCache = null;
 
-// Response Cache: 2-Minute TTL (120s) for responsive updates
+// Response cache with "stale-while-revalidate":
+//   - an entry is FRESH for ttlSeconds (default 2 min)
+//   - after that it is STALE but still served instantly for staleSeconds (default 15 min)
+//     while a background refresh runs, so users almost never wait on Salesforce
 const responseCache = {
   store: new Map(),
-  get(key) {
+  getEntry(key) {
     const entry = this.store.get(key);
     if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
+    const now = Date.now();
+    if (now > entry.staleUntil) {
       this.store.delete(key);
       return null;
     }
-    return entry.data;
+    return { data: entry.data, fresh: now <= entry.freshUntil };
   },
-  set(key, data, ttlSeconds = 120) {
+  get(key) {
+    const entry = this.getEntry(key);
+    return entry && entry.fresh ? entry.data : null;
+  },
+  set(key, data, ttlSeconds = 120, staleSeconds = 900) {
     // Custom ranges create new keys; cap the cache so it cannot grow forever
     if (this.store.size >= 50) this.store.delete(this.store.keys().next().value);
+    const now = Date.now();
     this.store.set(key, {
       data,
-      expiresAt: Date.now() + ttlSeconds * 1000,
+      freshUntil: now + ttlSeconds * 1000,
+      staleUntil: now + (ttlSeconds + staleSeconds) * 1000,
     });
   },
   delete(key) {
@@ -156,6 +166,18 @@ async function getQueueMembers(conn, queueId) {
   } catch (err) {
     return [];
   }
+}
+
+// Queue membership rarely changes, so remember it for a few minutes instead of 2 queries per refresh
+const MEMBERS_TTL_MS = 10 * 60 * 1000;
+const membersCache = new Map();
+
+async function getQueueMembersCached(conn, queueId) {
+  const hit = membersCache.get(queueId);
+  if (hit && Date.now() < hit.expiresAt) return hit.names;
+  const names = await getQueueMembers(conn, queueId);
+  if (names.length > 0) membersCache.set(queueId, { names, expiresAt: Date.now() + MEMBERS_TTL_MS });
+  return names;
 }
 
 function extractRawType(c) {
@@ -314,21 +336,59 @@ async function queryAllHistory(conn, soqlQuery) {
   return records;
 }
 
+// Runs tasks with at most `limit` in flight; results keep the order of `tasks`
 async function poolAll(tasks, limit = 5) {
-  const results = [];
-  const running = [];
-  for (const task of tasks) {
-    const p = Promise.resolve().then(task);
-    results.push(p);
-    if (limit <= tasks.length) {
-      const e = p.then(() => running.splice(running.indexOf(e), 1));
-      running.push(e);
-      if (running.length >= limit) {
-        await Promise.race(running);
-      }
+  const results = new Array(tasks.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < tasks.length) {
+      const i = next++;
+      results[i] = await tasks[i]();
     }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Owner-change history, fetched in parallel time slices
+// ---------------------------------------------------------------------------
+// The history query is the heaviest part (every owner change in the org for two months, 2,000 rows per page,
+// pages are sequential). Splitting it into windows lets several windows download at once.
+// Tune with HISTORY_SLICE_DAYS (0 = one window) and HISTORY_CONCURRENCY in .env if needed.
+const HISTORY_SLICE_DAYS = Math.max(0, parseInt(process.env.HISTORY_SLICE_DAYS || '7', 10) || 0);
+const HISTORY_CONCURRENCY = Math.max(1, parseInt(process.env.HISTORY_CONCURRENCY || '4', 10) || 4);
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const IST_OFFSET_MS = 330 * 60 * 1000;
+
+const soqlDate = (d) => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+// Start of a month in org time (IST), as a UTC instant
+function orgMonthStart(year, monthIndex) {
+  return new Date(Date.UTC(year, monthIndex, 1) - IST_OFFSET_MS);
+}
+
+// Splits [from, to) into windows, NEWEST first, so concatenated results stay newest-first
+function sliceWindows(from, to) {
+  if (!HISTORY_SLICE_DAYS) return [[from, to]];
+  const step = HISTORY_SLICE_DAYS * MS_PER_DAY;
+  const windows = [];
+  for (let start = from.getTime(); start < to.getTime(); start += step) {
+    windows.push([new Date(start), new Date(Math.min(start + step, to.getTime()))]);
   }
-  return Promise.all(results);
+  return windows.reverse();
+}
+
+async function fetchOwnerHistory(conn, from, to) {
+  const base = `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner'`;
+  const tasks = sliceWindows(from, to).map(([a, b]) => () =>
+    queryAllHistory(
+      conn,
+      `${base} AND CreatedDate >= ${soqlDate(a)} AND CreatedDate < ${soqlDate(b)} ORDER BY CreatedDate DESC`
+    )
+  );
+  const parts = await poolAll(tasks, HISTORY_CONCURRENCY);
+  return parts.flat();
 }
 
 // ---------------------------------------------------------------------------
@@ -376,11 +436,16 @@ function resolveRange(query) {
 }
 
 async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
+  const t0 = Date.now();
+  const marks = [];
+  const mark = (label) => marks.push(`${label} ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   try {
     const conn = await getSalesforceConnection(isRetry);
-    const queue = await getQueueMetadata(conn, queueName);
-    const schemaFields = await getCaseTypeFields(conn);
-    const directQueueMembers = await getQueueMembers(conn, queue.Id);
+    const [queue, schemaFields] = await Promise.all([
+      getQueueMetadata(conn, queueName),
+      getCaseTypeFields(conn),
+    ]);
+    mark('connect');
 
     const extraCols = [];
     if (schemaFields.hasRecordType) extraCols.push('RecordType.Name');
@@ -401,42 +466,36 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
       ORDER BY CreatedDate ASC
     `;
 
-    const historyQueries = [];
     const scope = scopeForRange(rangeParam);
     const customMatch = /^custom:(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2})$/.exec(scope);
-    const historySelect = `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner'`;
 
+    // One fetch covers every standard range (this month, last month, both); custom ranges fetch their own window
+    let historyFrom;
+    let historyTo;
     if (customMatch) {
-      const soqlDate = (d) => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
-      const from = parseDay(customMatch[1]);
-      const to = new Date(parseDay(customMatch[2]).getTime() + 24 * 60 * 60 * 1000);
-      historyQueries.push(
-        `${historySelect} AND CreatedDate >= ${soqlDate(from)} AND CreatedDate < ${soqlDate(to)} ORDER BY CreatedDate DESC`
-      );
-    } else if (scope === 'lastMonth') {
-      historyQueries.push(`${historySelect} AND CreatedDate = LAST_MONTH ORDER BY CreatedDate DESC`);
-    } else if (scope === 'thisMonth') {
-      historyQueries.push(`${historySelect} AND CreatedDate = THIS_MONTH ORDER BY CreatedDate DESC`);
+      historyFrom = parseDay(customMatch[1]);
+      historyTo = new Date(parseDay(customMatch[2]).getTime() + MS_PER_DAY);
     } else {
-      historyQueries.push(
-        `${historySelect} AND CreatedDate = THIS_MONTH ORDER BY CreatedDate DESC`,
-        `${historySelect} AND CreatedDate = LAST_MONTH ORDER BY CreatedDate DESC`
-      );
+      const orgNow = getOrgDateParts(new Date());
+      historyFrom = orgMonthStart(orgNow.year, orgNow.monthIndex - 1);
+      historyTo = orgMonthStart(orgNow.year, orgNow.monthIndex + 1);
     }
 
-    const [currentResult, ...historyResults] = await Promise.all([
-      conn.query(currentQueueSoql),
-      ...historyQueries.map((q) => queryAllHistory(conn, q)),
+    // Queue cases, queue members and owner history are independent, so fetch them together
+    const [currentRecords, directQueueMembers, historyRecords] = await Promise.all([
+      queryAllHistory(conn, currentQueueSoql), // pages through every queue case, not just the first 2,000
+      getQueueMembersCached(conn, queue.Id),
+      fetchOwnerHistory(conn, historyFrom, historyTo),
     ]);
+    mark(`queue cases (${currentRecords.length}) + history (${historyRecords.length})`);
 
-    const historyRecords = historyResults.flat();
     const caseMap = new Map();
     const caseInflowTimestamps = new Map();
     const caseAgentMap = new Map();
     const detectedHistoricalAgents = new Set(directQueueMembers);
     const rawTypesFound = new Set();
 
-    currentResult.records.forEach((c) => {
+    currentRecords.forEach((c) => {
       const rawT = extractRawType(c);
       if (rawT) rawTypesFound.add(rawT);
 
@@ -481,7 +540,7 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
     });
 
     // Update inflow timestamps for cases currently waiting in the queue
-    currentResult.records.forEach((c) => {
+    currentRecords.forEach((c) => {
       if (caseInflowTimestamps.has(c.Id)) {
         const entry = caseMap.get(c.Id);
         if (entry) {
@@ -535,6 +594,8 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
         });
       });
     }
+
+    mark(`missing cases (${missingCaseIds.length})`);
 
     const unifiedRecords = Array.from(caseMap.values());
     // Only actual queue members are reported; historical owners are not part of the roster
@@ -591,31 +652,43 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
       lastMonth
     );
 
-    // Base records for this scope; rolling/past-week/custom narrowing happens in applyRangeFilter()
-    const displayRecords =
-      scope === 'thisMonth' ? thisMonthRecords : scope === 'lastMonth' ? lastMonthRecords : unifiedRecords;
+    const generatedAt = new Date().toISOString();
+    const weeklyBifurcation = {
+      currentMonth: currentMonthBifurcation,
+      lastMonth: lastMonthBifurcation,
+      allWeeks: [
+        ...lastMonthBifurcation.weeks.map((w) => ({ ...w, month: lastMonthBifurcation.month })),
+        ...currentMonthBifurcation.weeks.map((w) => ({ ...w, month: currentMonthBifurcation.month })),
+      ],
+    };
 
-    const payload = {
+    const makePayload = (name, records) => ({
       success: true,
       queueName: queue.Name,
       queueId: queue.Id,
       instanceUrl: conn.instanceUrl,
-      range: scope,
+      range: name,
       queueAgents: resolvedQueueAgents,
-      totalSize: displayRecords.length,
-      records: displayRecords,
-      weeklyBifurcation: {
-        currentMonth: currentMonthBifurcation,
-        lastMonth: lastMonthBifurcation,
-        allWeeks: [
-          ...lastMonthBifurcation.weeks.map((w) => ({ ...w, month: lastMonthBifurcation.month })),
-          ...currentMonthBifurcation.weeks.map((w) => ({ ...w, month: currentMonthBifurcation.month })),
-        ],
-      },
-    };
+      totalSize: records.length,
+      records,
+      weeklyBifurcation,
+      generatedAt,
+    });
 
-    responseCache.set(`${queueName}_${scope}`, payload, 120);
-    return payload;
+    // One Salesforce fetch fills the cache for every standard range, so they always agree with each other
+    const payloads = customMatch
+      ? { [scope]: makePayload(scope, unifiedRecords) }
+      : {
+          thisMonth: makePayload('thisMonth', thisMonthRecords),
+          lastMonth: makePayload('lastMonth', lastMonthRecords),
+          bothMonths: makePayload('bothMonths', unifiedRecords),
+        };
+
+    Object.entries(payloads).forEach(([name, p]) => responseCache.set(`${queueName}_${name}`, p, 120));
+
+    mark('build');
+    console.log(`[FETCH] ${customMatch ? scope : 'all ranges'}: ${unifiedRecords.length} cases | ${marks.join(' | ')}`);
+    return payloads;
   } catch (err) {
     if ((err.errorCode === 'INVALID_SESSION_ID' || err.message.includes('Session expired')) && !isRetry) {
       console.warn('[RETRY] Session expired. Refreshing token...');
@@ -653,22 +726,40 @@ function applyRangeFilter(payload, spec) {
   return { ...payload, range: spec.range, totalSize: records.length, records };
 }
 
+// All standard ranges come from one Salesforce fetch, so they share one in-flight request.
+// Custom ranges that reach further back fetch (and cache) their own window.
+function flightKeyFor(queueName, scope) {
+  return scope.startsWith('custom:') ? `${queueName}_${scope}` : `${queueName}_core`;
+}
+
+// Starts (or joins) the Salesforce fetch for a scope; resolves to payloads keyed by scope
+function startFetch(queueName, scope) {
+  const key = flightKeyFor(queueName, scope);
+  if (!inFlightRequests.has(key)) {
+    inFlightRequests.set(
+      key,
+      executeInflowFetch(queueName, scope).finally(() => inFlightRequests.delete(key))
+    );
+  }
+  return inFlightRequests.get(key);
+}
+
 async function fetchInflowData(queueName = SF_QUEUE_NAME, spec = resolveRange({}), forceRefresh = false) {
   const cacheKey = `${queueName}_${spec.scope}`;
 
   if (!forceRefresh) {
-    const cached = responseCache.get(cacheKey);
-    if (cached) return applyRangeFilter(cached, spec);
+    const entry = responseCache.getEntry(cacheKey);
+    if (entry) {
+      // Stale data is still served instantly; refresh quietly in the background
+      if (!entry.fresh) {
+        startFetch(queueName, spec.scope).catch((err) => console.warn('[BACKGROUND REFRESH WARNING]', err.message));
+      }
+      return applyRangeFilter(entry.data, spec);
+    }
   }
 
-  if (!inFlightRequests.has(cacheKey)) {
-    inFlightRequests.set(
-      cacheKey,
-      executeInflowFetch(queueName, spec.scope).finally(() => inFlightRequests.delete(cacheKey))
-    );
-  }
-
-  return applyRangeFilter(await inFlightRequests.get(cacheKey), spec);
+  const payloads = await startFetch(queueName, spec.scope);
+  return applyRangeFilter(payloads[spec.scope], spec);
 }
 
 app.get('/api/queue-inflow', async (req, res) => {
@@ -707,25 +798,26 @@ app.get('/api/health', async (req, res) => {
 async function prewarmCache() {
   console.log('[PRE-WARM] Initializing RAM cache in background...');
   try {
-    for (const range of ['thisMonth', 'lastMonth', 'bothMonths']) {
-      const t0 = Date.now();
-      await fetchInflowData(SF_QUEUE_NAME, resolveRange({ range }));
-      console.log(`[PRE-WARM] "${range}" warmed in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-    }
+    const t0 = Date.now();
+    // One fetch fills this month, last month and both months together
+    await fetchInflowData(SF_QUEUE_NAME, resolveRange({ range: 'thisMonth' }));
+    console.log(`[PRE-WARM] all standard ranges warmed in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (err) {
     console.warn('[PRE-WARM WARNING]', err.message);
   }
 }
 
-// Auto-sync every 2 minutes
+// Keep the cache fresh every 2 minutes (one fetch covers every range; never overlaps itself)
+let syncRunning = false;
 setInterval(async () => {
+  if (syncRunning) return;
+  syncRunning = true;
   try {
-    await Promise.all([
-      executeInflowFetch(SF_QUEUE_NAME, 'thisMonth'),
-      executeInflowFetch(SF_QUEUE_NAME, 'bothMonths'),
-    ]);
+    await startFetch(SF_QUEUE_NAME, 'bothMonths');
   } catch (err) {
     console.warn('[SYNC WARNING]', err.message);
+  } finally {
+    syncRunning = false;
   }
 }, 2 * 60 * 1000);
 

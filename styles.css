@@ -716,3 +716,6 @@ body {
 @media (max-width: 1024px) {
   .agent-timeframe { max-width: 100%; justify-content: flex-start; }
 }
+
+/* Jump-to-cases: leave room for the sticky header so the list's toolbar isn't hidden under it */
+.table-section { scroll-margin-top: 96px; }
