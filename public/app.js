@@ -128,7 +128,7 @@ async function loadDashboardData() {
   setLoading(true);
 
   try {
-    let url = `/api/queue-inflow?queueName=${encodeURIComponent(state.queueName)}&range=${state.timeRange}`;
+    let url = `api/queue-inflow?queueName=${encodeURIComponent(state.queueName)}&range=${state.timeRange}`;
     if (state.timeRange === "custom") {
       url += `&start=${state.customStart}&end=${state.customEnd}`;
     }
@@ -150,6 +150,7 @@ async function loadDashboardData() {
       state.instanceUrl = typeof data.instanceUrl === "string" && /^https:\/\//.test(data.instanceUrl) ? data.instanceUrl : null;
       mapIncomingRecords(data.records);
       populateStatusFilterOptions();
+      populateTypeFilterOptions();
       populateToolFilterOptions();
       state.isLiveApiConnected = true;
       if (state.agentRange !== "SAME") loadAgentCases();
@@ -191,6 +192,12 @@ function normalizeType(rawType, subject = '') {
   ) {
     return 'Feature Request';
   }
+
+  // Salesforce's other Ticket Types keep their own names. Without this, "New Tool Request" would be taken
+  // for a Service Request just because it contains the word "request".
+  if (t === 'new tool request') return 'New Tool Request';
+  if (t === 'tool migration') return 'Tool Migration';
+  if (t === 'integration/automation') return 'Integration/Automation';
 
   if (t.includes('service') || t.includes('request') || t === 'sr') {
     return 'Service Request';
@@ -306,43 +313,86 @@ function parseLocalDate(iso) {
   return new Date(y, m - 1, d);
 }
 
+// Ticket Type options exactly as Salesforce lists them (same order as the Ticket Type field on a case).
+// Any other value found on tickets (for example "Analysis") is added after these automatically.
+const TICKET_TYPES = ["Feature Request", "Incident", "Service Request", "Query", "Tool Migration", "New Tool Request", "Integration/Automation"];
+
+function populateTypeFilterOptions() {
+  const select = document.getElementById("typeFilter");
+  if (!select) return;
+
+  const known = new Set(TICKET_TYPES.map((t) => t.toLowerCase()));
+  const extras = new Map(); // lower-case value -> spelling found on the tickets
+  state.cases.forEach((c) => {
+    const v = (c.rawType || "").trim();
+    if (v && !known.has(v.toLowerCase()) && !extras.has(v.toLowerCase())) extras.set(v.toLowerCase(), v);
+  });
+  const values = TICKET_TYPES.concat(Array.from(extras.values()).sort((a, b) => a.localeCompare(b)));
+
+  select.innerHTML =
+    `<option value="ALL">Type: All</option>` +
+    values.map((v) => `<option value="${escapeHtml(v)}">Type: ${escapeHtml(v)}</option>`).join("");
+
+  const keep = state.selectedTypeFilter === "ALL" || values.includes(state.selectedTypeFilter);
+  select.value = keep ? state.selectedTypeFilter : "ALL";
+  state.selectedTypeFilter = select.value;
+}
+
+// Incident, Service Request and Feature Request keep the dashboard's grouping (which also recognises variants such
+// as "Bug" or "Enhancement"). Every other option matches the ticket's own Ticket Type value.
+function matchesTicketType(c, selected) {
+  if (selected === "ALL") return true;
+  if (CORE_TYPES.includes(selected)) return c.type === selected;
+  return (c.rawType || "").trim().toLowerCase() === selected.toLowerCase();
+}
+
 // Tool Type picklist values (Case.Tools_Platform__c); anything else found in the data is added automatically
 const TOOL_TYPES = ["Salesforce", "Oneuptime", "Ace-academy", "Critsit", "Automation Deliverables", "Others"];
 const NO_TOOL = "__NO_TOOL__";
+
+// Compare tool types ignoring letter case, and treat "Others" and "Other" as the same value
+const toolKey = (v) => {
+  const k = String(v || "").trim().toLowerCase();
+  return k === "others" ? "other" : k;
+};
 
 function populateToolFilterOptions() {
   const select = document.getElementById("toolFilter");
   if (!select) return;
 
-  const known = new Set(TOOL_TYPES.map((t) => t.toLowerCase()));
-  const extras = new Set();
+  // Show each value the way Salesforce spells it on the tickets (for example "OneUptime"), if any ticket has it
+  const fromData = new Map();
   state.cases.forEach((c) => {
     const v = (c.toolType || "").trim();
-    if (v && !known.has(v.toLowerCase())) extras.add(v);
+    if (v && !fromData.has(toolKey(v))) fromData.set(toolKey(v), v);
   });
-  const values = TOOL_TYPES.concat(Array.from(extras).sort());
+  const knownKeys = new Set(TOOL_TYPES.map(toolKey));
+  const knownLabels = TOOL_TYPES.map((t) => fromData.get(toolKey(t)) || t);
+  const extras = Array.from(fromData.entries()).filter(([k]) => !knownKeys.has(k)).map(([, v]) => v).sort();
+  const values = knownLabels.concat(extras);
 
   select.innerHTML =
     `<option value="ALL">Tool Type: All</option>` +
     values.map((v) => `<option value="${escapeHtml(v)}">Tool Type: ${escapeHtml(v)}</option>`).join("") +
     `<option value="${NO_TOOL}">Tool Type: Not set</option>`;
 
-  const keep =
-    state.selectedToolFilter === "ALL" || state.selectedToolFilter === NO_TOOL || values.includes(state.selectedToolFilter);
-  select.value = keep ? state.selectedToolFilter : "ALL";
+  // Keep the current choice even if its spelling changed
+  let keep = state.selectedToolFilter;
+  if (keep !== "ALL" && keep !== NO_TOOL) keep = values.find((v) => toolKey(v) === toolKey(keep)) || "ALL";
+  select.value = keep;
   state.selectedToolFilter = select.value;
 }
 
 // Applies the Type and Tool Type dropdowns above the cases list
 function matchesTypeAndTool(c) {
-  if (state.selectedTypeFilter !== "ALL" && c.type !== state.selectedTypeFilter) return false;
+  if (!matchesTicketType(c, state.selectedTypeFilter)) return false;
 
   const tool = state.selectedToolFilter;
   if (tool !== "ALL") {
-    const v = (c.toolType || "").trim().toLowerCase();
+    const v = toolKey(c.toolType);
     if (tool === NO_TOOL) {
       if (v) return false;
-    } else if (v !== tool.toLowerCase()) {
+    } else if (v !== toolKey(tool)) {
       return false;
     }
   }
@@ -793,12 +843,9 @@ function renderAgentWorkloadTable() {
   });
 
   const rows = agentList.map((a) => ({ key: a, label: a, muted: false }));
-  if ((tally[UNASSIGNED_KEY] || {}).total > 0) {
-    rows.push({ key: UNASSIGNED_KEY, label: "Unassigned (still in queue)", muted: true });
-  }
-  if ((tally[OTHERS_KEY] || {}).total > 0) {
-    rows.push({ key: OTHERS_KEY, label: "Others (not on queue roster)", muted: true });
-  }
+  // These two rows are always shown (even with zeros) so the table has a stable shape
+  rows.push({ key: UNASSIGNED_KEY, label: "Unassigned (still in queue)", muted: true });
+  rows.push({ key: OTHERS_KEY, label: "Others (other queue members)", muted: true });
 
   if (rows.length === 0) {
     tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: #888; padding: 15px;">No cases in this timeframe.</td></tr>`;
@@ -914,7 +961,7 @@ async function loadAgentCases() {
   renderAgentNote();
 
   try {
-    let url = `/api/queue-inflow?queueName=${encodeURIComponent(state.queueName)}&range=${state.agentRange}`;
+    let url = `api/queue-inflow?queueName=${encodeURIComponent(state.queueName)}&range=${state.agentRange}`;
     if (state.agentRange === "custom") {
       url += `&start=${state.agentCustomStart}&end=${state.agentCustomEnd}`;
     }
@@ -1217,6 +1264,8 @@ function setupEventListeners() {
     refreshBtn.addEventListener("click", () => loadDashboardData());
   }
 
+  populateTypeFilterOptions();
+
   populateToolFilterOptions();
 
   const typeFilterEl = document.getElementById("typeFilter");
@@ -1261,6 +1310,7 @@ function handleFileUpload(event) {
         parseCSV(content);
       }
       populateStatusFilterOptions();
+      populateTypeFilterOptions();
       populateToolFilterOptions();
       alert(`Imported ${state.cases.length} records successfully.`);
     } catch (err) {
@@ -1544,7 +1594,7 @@ function openAgentDrill(key, type) {
 
   let title;
   if (key === UNASSIGNED_KEY) title = "Unassigned cases";
-  else if (key === OTHERS_KEY) title = "Cases owned by people outside the queue roster";
+  else if (key === OTHERS_KEY) title = "Cases owned by other queue members";
   else title = key || "All cases";
   if (type) title += ` — ${type}`;
 

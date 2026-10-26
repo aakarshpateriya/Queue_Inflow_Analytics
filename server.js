@@ -9,7 +9,13 @@ const jsforce = require('jsforce');
 
 const app = express();
 const PORT = process.env.PORT || 9001;
-const HOST = '0.0.0.0';
+// 0.0.0.0 = reachable from other machines. Set HOST=127.0.0.1 to keep it private behind a reverse proxy such as nginx.
+const HOST = process.env.HOST || '0.0.0.0';
+
+// Which tickets count: only those in the queue right now, or owned by a current queue member.
+// Tickets that were once in the queue but now belong to someone else are left out of every number.
+// Set INCLUDE_OTHER_OWNERS=true to bring the old behaviour back (they then appear under "Others").
+const INCLUDE_OTHER_OWNERS = process.env.INCLUDE_OTHER_OWNERS === 'true';
 
 app.use(cors());
 app.use(express.json());
@@ -187,43 +193,130 @@ async function getCaseTypeFields(conn) {
   }
 }
 
-async function getQueueMembers(conn, queueId) {
-  try {
-    const memberQuery = `
-      SELECT UserOrGroupId 
-      FROM GroupMember 
-      WHERE GroupId = '${queueId}'
-    `;
-    const memberRes = await conn.query(memberQuery);
-    const userIds = memberRes.records
-      .map((r) => r.UserOrGroupId)
-      .filter((id) => id && id.startsWith('005'));
-
-    if (userIds.length === 0) return [];
-
-    const userQuery = `
-      SELECT Id, Name 
-      FROM User 
-      WHERE Id IN (${userIds.map((id) => `'${id}'`).join(',')})
-      AND IsActive = true
-    `;
-    const userRes = await conn.query(userQuery);
-    return userRes.records.map((u) => u.Name);
-  } catch (err) {
-    return [];
-  }
-}
-
-// Queue membership rarely changes, so remember it for a few minutes instead of 2 queries per refresh
-const MEMBERS_TTL_MS = 10 * 60 * 1000;
+// ---------------------------------------------------------------------------
+// Queue membership
+// ---------------------------------------------------------------------------
+// A queue can hold users directly, public groups (which can hold more groups) and roles.
+// All of those are resolved, so a person who is "in the bucket" is recognised however they were added.
+//   roster   = active users added directly to the queue (each gets their own row in the dashboard)
+//   all      = every user in the queue by any route, active or not. Their tickets count; the ones not
+//              in the roster are shown together under "Others".
+//   complete = false when some part of the lookup failed, so callers know not to trust `all`.
+const MEMBERS_TTL_MS = 10 * 60 * 1000; // membership rarely changes, so remember it for a few minutes
 const membersCache = new Map();
+const MAX_GROUP_DEPTH = 6;
+
+const chunkList = (list, size = 150) => {
+  const out = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
+};
+const soqlIdList = (ids) => ids.map((id) => `'${String(id).replace(/'/g, '')}'`).join(',');
+
+async function resolveQueueMembership(conn, queueId) {
+  const directUserIds = new Set();
+  const allUserIds = new Set();
+  const roleRefs = []; // { id, withSubordinates }
+  const seenGroups = new Set([queueId]);
+  let complete = true;
+  let frontier = [queueId];
+
+  for (let depth = 0; frontier.length > 0; depth++) {
+    if (depth >= MAX_GROUP_DEPTH) {
+      complete = false; // groups nested deeper than we are willing to follow
+      break;
+    }
+    const nestedIds = [];
+    for (const ids of chunkList(frontier)) {
+      const rows = await queryAllHistory(
+        conn,
+        `SELECT GroupId, UserOrGroupId FROM GroupMember WHERE GroupId IN (${soqlIdList(ids)})`
+      );
+      rows.forEach((r) => {
+        const id = r.UserOrGroupId;
+        if (!id) return;
+        if (id.startsWith('005')) {
+          allUserIds.add(id);
+          if (depth === 0) directUserIds.add(id);
+        } else if (id.startsWith('00G') && !seenGroups.has(id)) {
+          seenGroups.add(id); // the "seen" set also stops loops such as group A containing group B containing A
+          nestedIds.push(id);
+        }
+      });
+    }
+
+    frontier = [];
+    for (const ids of chunkList(nestedIds)) {
+      const groups = await queryAllHistory(conn, `SELECT Id, Type, RelatedId FROM Group WHERE Id IN (${soqlIdList(ids)})`);
+      groups.forEach((g) => {
+        if (g.Type === 'Regular') frontier.push(g.Id);
+        else if (g.Type === 'Role') roleRefs.push({ id: g.RelatedId, withSubordinates: false });
+        else if (g.Type === 'RoleAndSubordinates' || g.Type === 'RoleAndSubordinatesInternal') {
+          roleRefs.push({ id: g.RelatedId, withSubordinates: true });
+        }
+      });
+    }
+  }
+
+  // Roles (and roles with everyone below them)
+  if (roleRefs.length > 0) {
+    const roleRows = await queryAllHistory(conn, 'SELECT Id, ParentRoleId FROM UserRole');
+    const children = new Map();
+    roleRows.forEach((r) => {
+      if (!r.ParentRoleId) return;
+      if (!children.has(r.ParentRoleId)) children.set(r.ParentRoleId, []);
+      children.get(r.ParentRoleId).push(r.Id);
+    });
+    const roleIds = new Set();
+    roleRefs.forEach(({ id, withSubordinates }) => {
+      roleIds.add(id);
+      if (!withSubordinates) return;
+      const stack = [id];
+      while (stack.length) {
+        (children.get(stack.pop()) || []).forEach((child) => {
+          if (!roleIds.has(child)) {
+            roleIds.add(child);
+            stack.push(child);
+          }
+        });
+      }
+    });
+    for (const ids of chunkList([...roleIds])) {
+      const users = await queryAllHistory(conn, `SELECT Id FROM User WHERE UserRoleId IN (${soqlIdList(ids)})`);
+      users.forEach((u) => allUserIds.add(u.Id));
+    }
+  }
+
+  // Names, and whether each user is active
+  const people = [];
+  for (const ids of chunkList([...allUserIds])) {
+    const users = await queryAllHistory(conn, `SELECT Id, Name, IsActive FROM User WHERE Id IN (${soqlIdList(ids)})`);
+    users.forEach((u) => people.push(u));
+  }
+
+  return {
+    roster: people.filter((u) => directUserIds.has(u.Id) && u.IsActive !== false).map((u) => u.Name),
+    all: new Set(people.map((u) => u.Name).filter(Boolean)),
+    complete,
+  };
+}
 
 async function getQueueMembersCached(conn, queueId) {
   const hit = membersCache.get(queueId);
-  if (hit && Date.now() < hit.expiresAt) return hit.names;
-  const names = await getQueueMembers(conn, queueId);
-  if (names.length > 0) membersCache.set(queueId, { names, expiresAt: Date.now() + MEMBERS_TTL_MS });
-  return names;
+  if (hit && Date.now() < hit.expiresAt) return hit.value;
+
+  let value;
+  try {
+    value = await resolveQueueMembership(conn, queueId);
+  } catch (err) {
+    console.warn('[MEMBERS WARNING]', err.message);
+    value = { roster: [], all: new Set(), complete: false };
+  }
+  // Only remember a complete answer, so a temporary failure is retried next time
+  if (value.complete && value.roster.length > 0) {
+    membersCache.set(queueId, { value, expiresAt: Date.now() + MEMBERS_TTL_MS });
+  }
+  return value;
 }
 
 function extractRawType(c) {
@@ -256,6 +349,12 @@ function normalizeType(rawType, subject = '') {
   ) {
     return 'Feature Request';
   }
+
+  // Salesforce's other Ticket Types keep their own names. Without this, "New Tool Request" would be taken
+  // for a Service Request just because it contains the word "request".
+  if (t === 'new tool request') return 'New Tool Request';
+  if (t === 'tool migration') return 'Tool Migration';
+  if (t === 'integration/automation') return 'Integration/Automation';
 
   if (t === 'service request' || t.includes('service') || t.includes('request') || t === 'sr') {
     return 'Service Request';
@@ -529,12 +628,13 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
     }
 
     // Queue cases, queue members and owner history are independent, so fetch them together
-    const [currentRecords, directQueueMembers, historyRecords] = await Promise.all([
+    const [currentRecords, membership, historyRecords] = await Promise.all([
       queryAllHistory(conn, currentQueueSoql), // pages through every queue case, not just the first 2,000
       getQueueMembersCached(conn, queue.Id),
       fetchOwnerHistory(conn, historyFrom, historyTo),
     ]);
     mark(`queue cases (${currentRecords.length}) + history (${historyRecords.length})`);
+    const directQueueMembers = membership.roster; // people who get their own row
 
     const caseMap = new Map();
     const caseInflowTimestamps = new Map();
@@ -551,6 +651,7 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
         CaseNumber: c.CaseNumber,
         Subject: c.Subject || '(No Subject)',
         agent: 'Unassigned',
+        InQueue: true, // owned by the queue itself right now
         Status: c.Status,
         Automation_Priority__c: c.Automation_Priority__c || 'Medium',
         Type: normalizeType(rawT, c.Subject),
@@ -634,6 +735,7 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
             CaseNumber: c.CaseNumber,
             Subject: c.Subject || '(No Subject)',
             agent: agentName,
+            InQueue: false, // already left the queue
             Status: c.Status,
             Automation_Priority__c: c.Automation_Priority__c || 'Medium',
             Type: normalizeType(rawT, c.Subject),
@@ -646,9 +748,28 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
 
     mark(`missing cases (${missingCaseIds.length})`);
 
-    const unifiedRecords = Array.from(caseMap.values());
+    const allRecords = Array.from(caseMap.values());
     // Only actual queue members are reported; historical owners are not part of the roster
     const resolvedQueueAgents = directQueueMembers.filter((name) => name && !isTargetQueue(name));
+
+    // Keep a ticket only if it is in the queue now, or owned by someone who is in the queue.
+    // "In the queue" means a member by any route: added directly, through a public group or a role, active or not.
+    // People in the roster get their own row; the other members are grouped under "Others".
+    // Everything downstream (cards, tabs, charts, agent table, list, exports) uses this list, so they all agree.
+    const members = membership.all;
+    let unifiedRecords = allRecords;
+    if (!INCLUDE_OTHER_OWNERS && membership.complete && members.size > 0) {
+      unifiedRecords = allRecords.filter((c) => c.InQueue || members.has(c.agent));
+      const left = allRecords.length - unifiedRecords.length;
+      const others = [...members].filter((n) => !resolvedQueueAgents.includes(n)).length;
+      console.log(
+        `[SCOPE] ${unifiedRecords.length} ticket(s) kept, ${left} left out (not in the queue, not owned by a queue member); ` +
+          `${resolvedQueueAgents.length} listed member(s) + ${others} other member(s)`
+      );
+    } else if (!INCLUDE_OTHER_OWNERS) {
+      // A failed or incomplete member lookup must not wipe out the data, so skip the owner check this time
+      console.warn('[SCOPE WARNING] queue membership could not be fully read, so tickets were not filtered by owner');
+    }
 
     // Timezone-Aware Partitioning against Org Now (IST)
     const nowOrg = getOrgDateParts(new Date());
